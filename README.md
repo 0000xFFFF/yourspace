@@ -12,6 +12,19 @@ my social media platform
 
 ## pages
 - accounts (bio, pic, posts, ...)
+a.k.a users
+    - can be: normal users, mods, admins
+- mods can 'view delete' posts (view delete: just means post is marked as deleted and normal users can't view them: mods and admins can)
+- admin pannel
+    - admins can also 'view delete' posts
+    - admins can also delete fully posts
+    - allows full control of accounts
+        - what account you are following
+    - can edit any users account delete his posts
+    - view extra info for all posts
+- my account (user, mod, admin)
+    - allows user to edit his pic, bio, name, username
+    - allows users to post, delete posts, make stickers, etc
 - posts (user, time, profile pic)
     - videos
     - image
