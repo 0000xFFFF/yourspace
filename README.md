@@ -9,6 +9,9 @@ my social media platform
 - rust backend html server render and send to user
 - real content caching (use rust's or redis? need to research)
 - load balancer (write own or use nginx)
+- rate limiter for pages
+    - tiny for media files (user needs to spam really hard to get limited)
+    - bigger for pages
 
 ## pages
 - accounts (bio, pic, posts, ...)
