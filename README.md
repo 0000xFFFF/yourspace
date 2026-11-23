@@ -3,6 +3,11 @@ my social media platform
 
 # it will include
 ## techstack
+- everything is ran in docker
+    - make Dockerfile for:
+        - postgres (db)
+        - my app (rust)
+        - nginx (balance loader)
 - written in rust
 - postgres or neo4j (need to plan db)
 - rabbitmq for messages?
