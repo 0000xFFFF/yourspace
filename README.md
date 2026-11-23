@@ -8,6 +8,7 @@ my social media platform
         - postgres (db)
         - my app (rust)
         - nginx (balance loader)
+    - make docker compose file that runs everything
 - written in rust
 - postgres or neo4j (need to plan db)
 - rabbitmq for messages?
