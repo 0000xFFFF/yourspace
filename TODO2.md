@@ -1,0 +1,3 @@
+- users can save posts
+    - by default saved posts are in a the default "*" collection
+    - when saving you can create a collection and name it 
