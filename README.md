@@ -1,6 +1,6 @@
 # yourspace
 
-A self-hosted social platform written in Rust. Server-rendered HTML, threaded posts, reposts and stories, public/private accounts with per-feature visibility controls, media with automatic sensitive-content filtering, realtime chat, and a mod/admin toolset. Anyone can browse public content without an account. Everything runs in Docker.
+A self-hosted social platform written in Rust. Server-rendered HTML, threaded posts, reposts and stories, public / friends-only / private visibility for each part of an account and for each individual post, notifications, media with automatic sensitive-content filtering, realtime chat, and a mod/admin toolset. Anyone can browse public content without an account. Everything runs in Docker.
 
 ---
 
@@ -18,7 +18,10 @@ A self-hosted social platform written in Rust. Server-rendered HTML, threaded po
 | Media storage | **Shared Docker volume**, served by nginx | Simple. Switch to MinIO/S3 when you outgrow a single host. |
 | Media/AI | **Ollama**: vision model for captions + text embedding model for search | Plus a dedicated NSFW classifier for the actual hide/show decision (see §7). |
 | Anonymous browsing | **Allowed**, read-only, public content only | Logged-out visitors see what the visibility rules allow (§3.3). Responses for visitors without a session cookie can be cached by nginx (§6). |
-| Privacy model | **One `is_private` flag + independent per-feature visibility toggles** | Private only changes the *defaults* (everything hidden, follow approval on). Every toggle can still be flipped individually, so a private account can show everything and a public one can hide anything (§3.2). |
+| Privacy model | **Three levels (`public`, `friends`, `private`) per account section and per post** | No public/private account switch. The account setting is the ceiling and an individual post can only narrow it, so `private` posts setting + `public` post = private (§3.2). |
+| Notifications | **Own `notifications` table + bell popup, separate from chat** | Chat has its own icon and unread badge, so message floods never bury replies or requests. Repeated events are grouped (§8.2). |
+| Trending | **Separate page from Discover** | Trending is the same for everyone and cheap to cache; Discover is exploratory and personalized when logged in (§4.3). |
+| Limits and flags | **Global limits and feature flags in `.env`** | Video 50 MB / 10 min, image 50 MB, plus switches for heavy parts such as the AI moderation worker (§13). |
 | Friends | **Derived, not stored** | Two accepted follows in opposite directions. No extra table to keep in sync (§3.4). |
 | Block / mute | **Separate `blocks` and `mutes` tables** | Block hides everything in both directions, mute only quiets feeds and stories (§3.5). |
 | Reports | **`reports` table + mod queue** | Users report posts, AI flags land in the same queue (§7). |
@@ -72,54 +75,76 @@ Suggested crates: `axum`, `tokio`, `tower-http`, `sqlx` (Postgres, compile-time 
 | Report a post | ✅ | ✅ | ✅ |
 | Review the report queue and AI-flagged posts, resolve or dismiss reports | ❌ | ✅ | ✅ |
 | View-delete a story | ❌ | ✅ | ✅ |
-| See posts / likes / follows / reposts / stories that an account has **hidden** | ❌ (own account only) | ❌ | ✅ |
+| See things an account restricted to `friends` or `private` (when not a friend) | ❌ (own account and friends only) | ❌ | ✅ |
+| Send site announcements and system notices | ❌ | ❌ | ✅ |
 
 **View-delete** = `posts.deleted_at` is set. Normal queries use the `public_posts` view (`deleted_at IS NULL`); mods and admins query `posts` directly. **Hard delete** removes the row; `ON DELETE CASCADE` cleans up replies, likes, tags, media links. Every mod/admin action writes to `audit_log`.
 
-Mods are ordinary users when it comes to **hidden profile sections** (last row above). They can still act on a specific post that reaches them through the report queue or an AI flag, but only that post.
+Mods are ordinary users when it comes to **restricted** content (the "friends / private" row above). They can still act on a specific post that reaches them through the report queue or an AI flag, but only that post.
 
 Role and visibility checks are enforced in one place (an axum extractor plus a single `Viewer` value, `Anonymous | User { id, role }`, passed into every query function), never only in templates and never re-implemented per handler.
 
-### 3.2 Account privacy
+### 3.2 Visibility levels
 
-Two independent things, stored in `user_privacy`:
+Every restrictable thing has one of three levels (`visibility_level` enum):
 
-- **`is_private`**: a flag that only decides the *defaults* below.
-- **Visibility toggles** (`show_posts`, `show_likes`, `show_follows`, `show_reposts`, `show_stories`) plus **`require_follow_approval`**. Each one is set individually, no matter what `is_private` says.
+| Level | Who can see it |
+|---|---|
+| `public` | Everyone, including anonymous visitors |
+| `friends` | The owner and their **friends** (mutual accepted follows, §3.4) |
+| `private` | The owner only (admins can still see it) |
 
-| Setting | Public default | Private default |
+**Account sections.** Each section has its own level in `user_privacy`: `posts_visibility`, `likes_visibility`, `follows_visibility` (the followers / following lists), `reposts_visibility` and `stories_visibility`. They are independent, so an account can have public posts, friends-only likes and private follows. Name, username, bio, **avatar** and date joined are always visible to everyone who has not been blocked.
+
+There is no separate "private account" switch. A "private account" is simply every section set to `private`; the registration page offers that as a preset (below).
+
+**Per-post visibility.** Each post also has its own `visibility` (`public | friends | private`), chosen in the composer and editable later. It is a different thing from the account setting, and they combine like this: **the account setting is the ceiling, and a post can only narrow it, never widen it.** The effective visibility is the stricter of the two:
+
+| Account `posts_visibility` | Post `visibility` | Effective |
 |---|---|---|
-| Name, username, bio, date joined | always visible | always visible |
-| `show_posts`, `show_likes`, `show_follows`, `show_reposts`, `show_stories` | on (shown) | off (hidden) |
-| `require_follow_approval` | off | on |
+| public | public | public |
+| public | friends | friends |
+| public | private | private |
+| friends | public | **friends** |
+| friends | private | private |
+| private | public | **private** |
+| private | friends | **private** |
 
-So a private account that shows everything is valid, and so is a public account that hides its likes.
+So an account whose posts are `private` only has private posts, even if every single post is marked public. Effective visibility is computed at read time, so changing the account setting later applies to every existing post immediately, without rewriting rows. Replies follow the same rule (a reply is a post with its own `visibility`). New posts default to `public`, which means the account setting alone decides unless the author narrows a specific post.
 
-**Future features:** when a new visibility toggle is added later, its column is backfilled with `NOT is_private`. Private accounts hide the new thing, public accounts show it, and everyone can change it afterwards.
+**Reposts and likes.**
 
-**Registration:** right after sign-up the user is redirected to `/welcome/privacy`, where they pick public or private and adjust the toggles. Until that page is submitted (`privacy_onboarded = false`) the account behaves as private with everything hidden, and logged-in navigation keeps redirecting there. Nothing is exposed by accident if someone closes the tab.
+- Only posts whose effective visibility is `public` can be reposted. A repost is listed according to `reposts_visibility`, and only to viewers who can also see the original.
+- `likes_visibility` controls who can see which posts a user has liked, and their entry in a post's likers list. Like counts stay visible.
 
-**Public → private later:** a popup lists every toggle (hide posts, likes, follows, reposts, stories, require follow approval, and any future ones), pre-set to the private defaults and editable. Nothing is saved until the user confirms. Existing followers are kept and count as approved. Private → public only flips `is_private`; the toggles keep their current values and can be changed in `/settings/privacy`.
+**Follow approval** (`require_follow_approval`, default off) is a separate setting, see §3.4.
+
+**Registration.** Right after sign-up the user is redirected to `/welcome/privacy`. Until that page is submitted (`privacy_onboarded = false`) every section behaves as `private` and logged-in navigation keeps redirecting there, so nothing is exposed if someone closes the tab. The page offers three presets (**Public**, **Friends only**, **Private**) that fill all five section selectors plus the follow-approval checkbox, and each selector can then be changed individually. Presets are UI only and are not stored.
+
+**Future features.** When a new section is added later, its column is backfilled with the **strictest** level among the account's existing sections, so nobody is exposed by a feature they never saw. Everyone can change it afterwards.
 
 ### 3.3 Who can see what
 
-| Viewer | Name, username, bio, date joined | Section whose toggle is **on** | Section whose toggle is **off** |
-|---|:--:|:--:|:--:|
-| Owner | ✅ | ✅ | ✅ |
-| Admin | ✅ | ✅ | ✅ |
-| Approved follower | ✅ | ✅ | ✅ only if the owner has `require_follow_approval` on |
-| Any other logged-in user, **including mods** | ✅ | ✅ | ❌ |
-| Anonymous visitor | ✅ | ✅ | ❌ |
-| Blocked either way (§3.5) | ❌ | ❌ | ❌ |
+| Viewer | Always visible (name, username, bio, avatar, joined) | `public` | `friends` | `private` |
+|---|:--:|:--:|:--:|:--:|
+| Owner | ✅ | ✅ | ✅ | ✅ |
+| Admin | ✅ | ✅ | ✅ | ✅ |
+| Friend (mutual accepted follow) | ✅ | ✅ | ✅ | ❌ |
+| Any other logged-in user, **including mods** | ✅ | ✅ | ❌ | ❌ |
+| Anonymous visitor | ✅ | ✅ | ❌ | ❌ |
+| Blocked either way (§3.5) | ❌ (profile not found) | ❌ | ❌ | ❌ |
 
-The same predicate, `can_view_section(viewer, owner, section)`, is applied everywhere: profile tabs, feeds, search, discover, direct post links, and thread pages. A reply written by an account that hides its posts is shown in a thread as a collapsed "hidden reply" placeholder so the tree keeps its shape. Counters (like count, repost count) stay visible; the *lists* of who liked or reposted follow the toggles.
+A user who follows you but is not your friend counts as "any other user": they only see your `public` things.
+
+One predicate, `can_view(viewer, owner, level)`, is applied everywhere: profile tabs, feeds, trending, search, discover, direct post links and thread pages. For posts, `level` is the effective visibility from §3.2. A thread page requires being able to view the thread's root post. Replies the viewer may not see are shown as a collapsed "hidden reply" placeholder so the tree keeps its shape. Counters (like count, repost count, follower count) stay visible; the *lists* behind them follow the levels.
 
 ### 3.4 Following, approval and friends
 
 - `follows.status` is `pending` or `accepted`. Following an account without approval inserts `accepted` directly. With approval it inserts `pending` and the button shows "Requested" (cancelling deletes the row).
-- The owner handles requests in `/follow-requests`. Accept sets `accepted`, decline deletes the row. Pending follows do not count in `follower_count` / `following_count` and give no feed or section access.
-- Switching approval off does **not** auto-accept pending requests; they stay in the queue until handled.
-- **Friends** = two `accepted` follows in opposite directions. It is derived by query (the `follows (followee_id, follower_id)` index already covers it), shown as a "Friends" badge, and powers the **Friends feed** (§4.3). Unfollowing or blocking ends the friendship.
+- The owner handles requests in `/follow-requests` (or inline in the notifications popup, §8.2). Accept sets `accepted`, decline deletes the row. Pending follows do not count in `follower_count` / `following_count`.
+- **Turning approval on** does not touch existing followers.
+- **Turning approval off** opens a dialog about requests that are still pending, with three radio buttons: **Stay pending** (default), **Reject all** and **Accept all**.
+- **Friends** = two `accepted` follows in opposite directions. It is derived by query (the `follows (followee_id, follower_id)` index already covers it), shown as a "Friends" badge, and powers the `friends` visibility level and the **Friends feed** (§4.3). Unfollowing or blocking ends the friendship, and anything the other person could see only as a friend becomes hidden from them again.
 
 ### 3.5 Block and mute
 
@@ -127,17 +152,18 @@ The same predicate, `can_view_section(viewer, owner, section)`, is applied every
 |---|---|---|
 | Direction | One-way (muter stops seeing the muted account's content) | Both directions: neither side can see the other |
 | Posts and stories | Hidden from feeds, discover, search and the story tray | Hidden everywhere |
-| Replies in threads | Still shown (assumption, see §15) | Hidden: you cannot see them in a comment section, and they cannot see yours |
+| Replies in threads | Still shown | Hidden: you cannot see them in a comment section, and they cannot see yours |
 | Profile | Still visitable | Not visitable (behaves as not found) |
 | Follows | Kept | Removed in both directions, and neither can follow again |
 | Chat | Unaffected | No new DMs in either direction; any existing conversation is hidden from the blocker and read-only for the blocked user |
 | Notified | No | No |
+| Notifications | Still created (§8.2) | Never created in either direction |
 
 Implementation: every query that returns posts, stories, users or messages goes through the same `Viewer` filter, which does `NOT EXISTS` against `blocks` (and `mutes` for feeds). Each user's block and mute ID sets are cached in Redis and invalidated on change. Cached post fragments stay viewer-agnostic; the filtering happens before rendering (§6).
 
 ### 3.6 Anonymous visitors
 
-Logged-out users can browse public content: home and discover feeds, public profiles, post and thread pages, tags and search. They are read-only (no likes, follows, reposts, polls, chat). Visibility rules (§3.3) apply as for any non-follower. Visitors have no settings, so **sensitive media is hidden by default** and can be revealed with the "show" button. Anonymous traffic is rate limited per IP like any other page request (§9).
+Logged-out users can browse public content: home and discover feeds, public profiles, post and thread pages, tags and search. They are read-only (no likes, follows, reposts, polls, chat). They only ever see `public` things (§3.3). Visitors have no settings, so **sensitive media is hidden by default** and can be revealed with the "show" button. Anonymous traffic is rate limited per IP like any other page request (§9).
 
 ---
 
@@ -173,6 +199,12 @@ erDiagram
     USERS ||--o{ MUTES : "muted"
     USERS ||--o{ REPORTS : files
     POSTS ||--o{ REPORTS : "reported in"
+
+    USERS ||--|| NOTIFICATION_SETTINGS : has
+    USERS ||--o{ NOTIFICATIONS : receives
+    USERS ||--o{ NOTIFICATIONS : "causes"
+    POSTS ||--o{ NOTIFICATIONS : "about"
+    USERS ||--o{ ANNOUNCEMENTS : writes
 
     POSTS ||--o{ POSTS : "parent of"
     POSTS ||--o{ LIKES : receives
@@ -217,13 +249,12 @@ erDiagram
     }
     USER_PRIVACY {
         bigint user_id PK, FK
-        bool is_private "only changes the defaults"
+        visibility_level posts_visibility "public | friends | private"
+        visibility_level likes_visibility
+        visibility_level follows_visibility
+        visibility_level reposts_visibility
+        visibility_level stories_visibility
         bool require_follow_approval
-        bool show_posts
-        bool show_likes
-        bool show_follows
-        bool show_reposts
-        bool show_stories
         bool privacy_onboarded "false until the welcome page is submitted"
     }
     SESSIONS {
@@ -261,6 +292,7 @@ erDiagram
         int depth
         text body_md
         text body_html "sanitized render"
+        visibility_level visibility "per post, can only narrow the account setting"
         int like_count
         int reply_count
         int repost_count
@@ -401,9 +433,42 @@ erDiagram
         jsonb meta
         timestamptz created_at
     }
+    NOTIFICATIONS {
+        bigint id PK
+        bigint recipient_id FK
+        notification_kind kind "follow_request | post_comment | system | ..."
+        bigint actor_id FK "NULL for system notices"
+        bigint post_id FK "NULL when not about a post"
+        text group_key "collapses repeated events"
+        int count "events in this group"
+        jsonb data "title, body, link"
+        timestamptz created_at "latest activity"
+        timestamptz read_at
+    }
+    NOTIFICATION_SETTINGS {
+        bigint user_id PK, FK
+        bool post_comments
+        bool comment_replies
+        bool follow_requests
+        bool follow_accepted
+        bool new_followers
+        bool mentions
+        bool reposts
+        bool likes
+        bool poll_results
+        timestamptz announcements_seen_at
+    }
+    ANNOUNCEMENTS {
+        bigint id PK
+        bigint created_by FK
+        text title
+        text body_md
+        timestamptz created_at
+        timestamptz expires_at
+    }
 ```
 
-The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) is in [`schema.sql`](schema.sql). **Note:** `schema.sql` still describes the first version of the model. The tables and columns added in this revision (`user_privacy`, `reposts`, `stories`, `story_views`, `blocks`, `mutes`, `reports`, `follows.status`, the `posts` moderation fields, `user_settings.hide_typing_indicator`) have to be added to it.
+The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) is in [`schema.sql`](schema.sql). **Note:** `schema.sql` still describes the first version of the model. The tables and columns added in this revision (`user_privacy`, `reposts`, `stories`, `story_views`, `blocks`, `mutes`, `reports`, `notifications`, `notification_settings`, `announcements`, the `visibility_level` and `follow_status` enums, `follows.status`, `posts.visibility`, the `posts` moderation fields, `user_settings.hide_typing_indicator`) have to be added to it.
 
 ### 4.2 Modeling notes
 
@@ -417,10 +482,12 @@ The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) 
 - **Emojis** are stored as plain Unicode. `:joy:` autocomplete is frontend-only and inserts the Unicode character, so the DB and search need nothing special.
 - **Stickers** are `media` rows wrapped by `stickers`, allowed in posts (`post_stickers`) and chat (`messages.sticker_id`).
 - **IDs** are `BIGINT` identity columns (small indexes, keyset pagination). If you later want non-enumerable public IDs, add a separate `public_id` column rather than switching primary keys.
-- **Privacy**: `user_privacy` is a 1:1 table (one row per user, created at registration in the same transaction). It is read on almost every request, so it is cached in `moka`/Redis and invalidated on change. Adding a toggle = new column, backfilled with `NOT is_private` (§3.2).
+- **Privacy**: `user_privacy` is a 1:1 table (one row per user, created at registration in the same transaction; every section starts as `private` until the welcome page is submitted). It is read on almost every request, so it is cached in `moka`/Redis and invalidated on change. Adding a section = new `visibility_level` column, backfilled with the strictest existing level (§3.2).
+- **Per-post visibility**: `posts.visibility` (default `public`) holds the author's choice for that post. The effective level is `stricter(user_privacy.posts_visibility, posts.visibility)`, computed at read time, so an account setting change needs no row rewrites. Queries for anonymous visitors, discover and trending filter on `visibility = 'public'` joined to the cached account level; if that join ever becomes a bottleneck, denormalize an `effective_visibility` column and recompute it in a background job when the account setting changes.
 - **Follows** carry a `status` (`pending` | `accepted`). A decline or a cancelled request deletes the row. **Friends** are never stored; they are the self-join of two `accepted` rows.
-- **Reposts**: a plain `(user_id, post_id)` row, no quote text. Reposts show up in feeds as "X reposted" and in the reposter's profile when `show_reposts` allows it. Posts from private accounts cannot be reposted, because a repost would expose them outside the account's own visibility rules.
+- **Reposts**: a plain `(user_id, post_id)` row, no quote text. Reposts show up in feeds as "X reposted" and in the reposter's profile according to `reposts_visibility`. Only posts whose effective visibility is `public` can be reposted, because a repost would otherwise expose them outside the author's rules. If the original is later restricted, the repost disappears for viewers who can no longer see the original.
 - **Stories**: media-only (plus optional caption) posts that expire. `expires_at = created_at + 24h`; readers filter on `expires_at > now()`, and a worker purges expired rows and their media after a retention period. Stories go through the same media pipeline as posts, carry the same `deleted_at` view-delete marker, and `story_views` records who has seen each one.
+- **Notifications**: one row per recipient and event, with `kind`, optional `actor_id` / `post_id`, a `data` JSON for display text, `read_at`, and a `group_key` + `count` for grouping. A partial unique index on `(recipient_id, group_key) WHERE read_at IS NULL AND group_key IS NOT NULL` makes the grouping an upsert. A partial index on `(recipient_id) WHERE read_at IS NULL` serves the unread counter. Chat is not stored here (§8.1). Site-wide updates live once in `announcements`.
 - **Blocks and mutes**: two small edge tables with composite primary keys and `CHECK (a <> b)`. Block is symmetric in effect but stored once, as `(blocker_id, blocked_id)`.
 - **Reports**: one row per `(reporter_id, post_id)` (unique), with `status` `open | resolved | dismissed`. Resolving can trigger a view-delete; both are written to `audit_log`.
 - **AI sensitivity flags**: `posts.sensitivity` is the worst verdict across the post's text (LLM text check) and its attached media (`media.sensitivity`), recomputed by the worker whenever a check finishes. `moderation_labels` keeps the raw labels/scores, and `moderation_model` + `moderation_checked_at` record which model decided and when, so verdicts can be re-run after a model change. `sensitive` posts are blurred for users with `hide_sensitive` on; `blocked` posts are withheld from everyone except the owner, mods and admins until reviewed. `sensitive` and `blocked` posts appear in the mod queue next to user reports. Media (and therefore stories and chat media) carries the same fields.
@@ -436,7 +503,19 @@ The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) 
 
 Fan-out on write (precomputed timelines) only becomes worthwhile when accounts have huge follower counts.
 
-Every feed applies the visibility predicate from §3.3 (hidden `show_posts` / `show_reposts`) and the viewer's blocks and mutes. Stories are not part of the feeds; they appear in a story tray built from followees with an unexpired story, minus blocked and muted accounts and accounts whose `show_stories` is off for that viewer.
+Every feed applies the visibility predicate from §3.3 (effective post visibility, `reposts_visibility`) and the viewer's blocks and mutes. A follower who is not a friend therefore only sees `public` posts in the Following feed. Stories are not part of the feeds; they appear in a story tray built from followees with an unexpired story, minus blocked and muted accounts and accounts whose `stories_visibility` doesn't allow that viewer.
+
+**Discover vs Trending.** They answer different questions, so they are separate pages:
+
+- **Discover** is for exploring: suggested accounts, tags and posts you might like. Personalized when logged in (based on who and which tags you follow), and a generic public mix for anonymous visitors.
+- **Trending** is "what is blowing up right now" and is the **same for everyone**, which makes it cheap to cache and a good landing page for anonymous visitors. Tabs: **Posts** and **Tags**, with a window selector (last hour / today / this week).
+
+How Trending is computed (a periodic worker job, switchable with `FEATURE_TRENDING_JOB`):
+
+1. Candidates: posts with effective visibility `public`, not view-deleted, not `blocked` by the AI filter.
+2. Score: engagement by **distinct users** (likes, reposts, replies, weighted) divided by an age decay, e.g. `engagement / (age_hours + 2)^1.5`.
+3. Tags: number of distinct *authors* using the tag in the window compared with the previous window, with a minimum number of distinct authors so one person spamming a tag cannot trend it. An admin-managed banlist can exclude tags.
+4. The result is written to Redis sorted sets (e.g. `trending:posts:24h`, `trending:tags:1h`). Per-viewer filtering (blocks, mutes, sensitive-media blur) happens when the list is rendered, never inside the stored result.
 
 ---
 
@@ -457,7 +536,7 @@ Every feed applies the visibility predicate from §3.3 (hidden `show_posts` / `s
 | nginx `proxy_cache` | `/static/*` | 1 h |
 | nginx `proxy_cache` (anonymous only, **planned**, not in `nginx.conf` yet) | public pages for requests with no session cookie, keyed by URL; bypassed whenever a session cookie is present | 15 s |
 | `moka` (in-process, L1) | hot user cards, rendered post fragments, role/settings lookups | 5-30 s |
-| Redis (shared, L2) | feed ID lists, counters, discover sets, rate-limit state, session lookups | seconds to minutes |
+| Redis (shared, L2) | feed ID lists, counters, discover and trending sets, unread notification counters, block/mute ID sets, rate-limit state, session lookups | seconds to minutes |
 | Postgres | source of truth | n/a |
 
 Rules: cache **post fragments** keyed by `(post_id, edited_at)` and apply per-viewer concerns (sensitive-media blur, view-delete visibility) at render time, not inside the cached fragment. Invalidate on edit/delete by deleting the key and publishing an invalidation on Redis pub/sub so every replica drops its L1 copy.
@@ -491,22 +570,80 @@ sequenceDiagram
 - **Pending media is hidden from everyone but the owner** until classified. No window where unmoderated content is publicly visible.
 - **Hide-for-users-who-enabled-it**: if `user_settings.hide_sensitive` is true and `media.sensitivity = 'sensitive'`, the server renders a placeholder with a "show" button (HTMX swap) and **does not send the bytes**. `/media/:id` is the enforcement point: the app authorizes, then replies with `X-Accel-Redirect` so nginx streams the file.
 - **Classifier choice**: a general vision LLM is a weak and slow NSFW detector. Use a dedicated lightweight NSFW image classifier (ONNX via the `ort` crate or a small sidecar) for the decision, and use the Ollama vision model for captions and as a second opinion on borderline scores. Check the current model options in the Ollama library when you pick; the compose file defaults to `moondream` + `nomic-embed-text` as a starting point.
-- **Videos**: classify N keyframes (e.g. 1 per 2 s, capped); sensitive if any frame crosses the threshold. Transcode to H.264/MP4 with a size/duration cap.
-- **Upload limit**: videos are capped at **50 MB**. The app rejects larger files, and `client_max_body_size` in `nginx.conf` (currently `100m`) must be lowered to match.
+- **Videos**: classify N keyframes (e.g. 1 per 2 s, capped); sensitive if any frame crosses the threshold. Transcoding to H.264/MP4 on upload is a maybe (§15); for now videos are stored as uploaded.
+- **Upload limits** (global, set in `.env`, §13.2): videos up to **50 MB and 10 minutes**, images up to **50 MB**. The app rejects larger or longer files with an error message (duration is checked with `ffprobe` before accepting), and `client_max_body_size` in `nginx.conf` (currently `100m`) must match the larger size limit.
+- **Heavy steps are flag-gated** (§13.3): the AI moderation, video analysis, captioning and embedding steps can each be switched off. With moderation off, the worker marks content `safe` with `moderation_model = 'disabled'` so it can be re-checked later.
 - **Text and post-level flags**: the worker also runs the post text through an Ollama LLM check. The result is combined with the media verdicts into `posts.sensitivity` and stored with its raw labels, model name and timestamp (§4.2). Text-only posts are visible immediately and get their verdict within seconds; posts with media stay hidden from everyone but the owner until their media is classified.
 - **Flag handling**: `sensitive` posts are blurred for users with `hide_sensitive` on (and for anonymous visitors). `sensitive` and `blocked` posts are queued for mods, together with user reports. A mod resolving a report can view-delete the post, and both actions are written to `audit_log`.
 
 ---
 
-## 8. Chat
+## 8. Chat and notifications
+
+### 8.1 Chat
 
 - WebSocket at `/ws` (nginx upgrades it, 1 h read timeout).
 - **Send**: validate membership → `INSERT messages` → publish on Redis channel `conv:{id}` → every replica forwards to its connected members.
 - **Read receipt**: client reports the last visible message → `UPDATE conversation_members.last_read_message_id` → publish.
 - **Typing**: client event (throttled ~1/3 s) → Redis pub/sub only. If any member of a conversation has `hide_typing_indicator` on, typing events are suppressed in that conversation both ways: their own indicator is not sent, and they do not receive the others'. In a 1:1 chat that means neither side sees an indicator. In a group, only the members who turned it on are affected.
-- **Blocks and DM policy**: a message is accepted only if neither side has blocked the other and the recipient's `dm_policy` allows the sender (§3.5).
 - **Offline users** get messages on next load via `messages (conversation_id, id DESC)` keyset pagination.
 - Media and stickers in chat go through the same upload and moderation pipeline as posts.
+- **Blocks and DM policy**: a message is accepted only if neither side has blocked the other and the recipient's `dm_policy` allows the sender (§3.5).
+- **Unread badge**: the number next to the chat icon in the topbar comes from `conversation_members.last_read_message_id` compared with the latest message. It counts unread *conversations* (muted ones excluded, capped at 99+). **Chat never writes to `notifications`**, so a flood of messages cannot bury anything else.
+
+### 8.2 Notifications
+
+The topbar has a bell icon that opens a popup with tabs **All | Requests | Replies | System**; `/notifications` shows the full list. Chat has its own icon and badge (§8.1) and is deliberately not part of this list: an influencer who gets bombarded with DMs still sees every reply and request.
+
+| Kind | When it is created | Controlled by | Notes |
+|---|---|---|---|
+| `follow_request` | Someone asks to follow you (approval on) | `follow_requests` | Accept / decline inline; the row disappears once handled |
+| `follow_accepted` | Your follow request was accepted | `follow_accepted` | |
+| `new_follower` | Someone follows you (approval off) | `new_followers` | Shows a "follow back to become friends" shortcut |
+| `post_comment` | Someone replied directly to your thread-start post | `post_comments` | Grouped per post |
+| `comment_reply` | Someone replied to one of **your replies** | `comment_replies` | Grouped per comment |
+| `mention` | Someone wrote `@yourusername` | `mentions` | Needs mention parsing in posts |
+| `repost` | Someone reposted your post | `reposts` (default off) | Grouped per post |
+| `like` | Someone liked your post | `likes` (default off) | Grouped per post |
+| `poll_closed` | A poll you created or voted in closed | `poll_results` | |
+| `system` | Moderation and site messages (below) | cannot be turned off | Pinned at the top |
+
+`friend requests` in the popup are the `follow_request` rows. Because friends are mutual follows (§3.4), a "friend request" is a follow request on an account with approval on, and the friendship exists once both directions are accepted.
+
+**System notices** (`system`, never suppressible): content removed by a mod (with the reason and a link to the rules), post marked sensitive by the AI filter, outcome of a report you filed, warning, account suspended / banned, role changed, security events (password changed, login from a new device), media rejected (too long / too large), terms of service updates. A suspended account is blocked from the site but is shown its notices on the suspension page at login.
+
+**Site updates** are stored once in `announcements` and merged into every user's list at read time (`announcements_seen_at` tracks what they've seen), instead of copying one row to every user.
+
+**How it avoids drowning the user:**
+
+1. **Chat is separate** (§8.1).
+2. **Grouping**: high-volume kinds collapse into one row per target, e.g. "Alice and 212 others replied to your post". Implemented as an upsert on `(recipient_id, group_key)` for unread rows, bumping `count` and `created_at`.
+3. **Per-type settings** (§8.3). A disabled type is never created, rather than created and hidden.
+4. **System notices are pinned** and are never grouped, limited or disabled.
+5. **Retention**: read notifications are purged after `NOTIFICATION_RETENTION_DAYS` (§13.3 / .env), and the list is capped per user.
+6. **Paged** popup (latest 20, "see all" opens `/notifications`).
+
+**Delivery:** a notification row is written by the app in the same transaction as the event that causes it (reply, follow request, ...), so there is no extra queue to fail. The unread count is a Redis counter (rebuilt from Postgres on a miss) and is pushed to the browser as a `notification.count` event over `/ws`; without a WebSocket the bell falls back to polling every 60 s.
+
+**Rules:** no notification is created for your own actions or for actions by an account that has blocked you or that you blocked. Notifications from muted accounts are still created (§3.5, mute only affects feeds, discover, search and stories). When a notification is rendered it goes through the visibility predicate (§3.3); if you can no longer see the post it points to, it shows "content no longer available".
+
+### 8.3 Notification settings
+
+`/settings/notifications`, stored in `notification_settings` (one row per user):
+
+| Setting | Default |
+|---|:--:|
+| Comments on your posts (`post_comments`) | on |
+| Replies to your comments (`comment_replies`) | on |
+| Friend / follow requests (`follow_requests`) | on |
+| Your follow request was accepted (`follow_accepted`) | on |
+| New followers (`new_followers`) | on |
+| Mentions (`mentions`) * | on |
+| Reposts of your posts (`reposts`) * | off |
+| Likes on your posts (`likes`) * | off |
+| Poll results (`poll_results`) * | on |
+
+\* proposed. System notices have no toggle. Ideas for later, not planned: quiet hours and a daily digest.
 
 ---
 
@@ -528,17 +665,41 @@ Anonymous visitors are covered by the same per-IP limits as everyone else. Their
 
 ## 10. Pages and routes
 
+### 10.1 Pages
+
 | Area | Pages |
 |---|---|
-| Public (no login needed) | `/` feed, `/discover`, `/search?q=`, `/tag/:name`, `/p/:id` post + full thread, `/u/:username` profile (what the visibility rules allow) |
-| Auth | `/login`, `/register`, `/welcome/privacy` (public/private choice and toggles, shown right after registration) |
-| Posts | compose (markdown, media, stickers, poll, tags), repost, report |
+| Public (no login needed) | `/` (logged out: Discover), `/discover`, `/trending`, `/search?q=`, `/tag/:name`, `/p/:id` post + full thread, `/u/:username` profile (what the visibility levels allow) |
+| Auth | `/login`, `/register`, `/welcome/privacy` (presets + per-section visibility, shown right after registration) |
+| Posts | compose (markdown, media, stickers, poll, tags, **per-post visibility**), repost, report |
 | Stories | story tray, `/stories/:username`, create story |
-| Feeds | `/following`, `/friends` (mutual follows only), `/discover` |
-| Account | `/settings` (profile edit, hide sensitive, DM policy, theme, hide typing indicator), `/settings/privacy` (public/private, visibility toggles, follow approval), `/follow-requests`, `/blocked` (blocks and mutes), `/stickers` (create/manage) |
+| Feeds | `/following` (logged-in home), `/friends` (mutual follows only), `/fyp` (later), `/discover`, `/trending` |
+| Notifications | topbar bell popup, `/notifications` |
+| Account | `/settings` (profile edit, hide sensitive, DM policy, theme, hide typing indicator), `/settings/privacy` (section visibility levels, follow approval), `/settings/notifications`, `/follow-requests`, `/blocked` (blocks and mutes), `/stickers` (create/manage) |
 | Chat | `/chat`, `/chat/:id`, `/ws` |
 | Mod | view-delete / restore on any post or story; report queue and AI-flagged posts |
-| Admin | `/admin` dashboard, `/admin/users/:id` (edit anything, role, suspend, follow list), `/admin/posts/:id` (extra info, hard delete), audit log |
+| Admin | `/admin` dashboard, `/admin/users/:id` (edit anything, role, suspend, follow list), `/admin/posts/:id` (extra info, hard delete), audit log, announcements |
+
+### 10.2 Topbar
+
+**Logged out**
+
+```
+[ Login ] [ Register ]                              [ Search ]  Trending  Discover
+```
+
+**Logged in**
+
+```
+[ (avatar) Name ]   Following  Friends  FYP  Trending  Discover        [ Search ] [ + Post ] [ 🔔 3 ] [ 💬 2 ] [ ☰ ]
+```
+
+- **Left:** the account button (avatar and display name) goes to your own profile. Next to it the feed links: Following, Friends, FYP, Trending, Discover. FYP stays hidden until it exists.
+- **Right (logged in):** search, a "+ Post" button, the notification bell with its unread count (§8.2), the chat icon with its own unread badge (§8.1), and a menu (☰).
+- **Menu:** Settings, Privacy, Notifications settings, Blocked / muted, Stickers, **Mod queue** (mods and admins), **Admin panel** (admins), Log out.
+- **Logged out:** Login / Register on the left, Discover and Trending on the right, search next to them. Only what an anonymous visitor can use is shown.
+- **Small screens:** the feed links collapse into a horizontally scrollable second row; bell, chat and "+ Post" stay in the bar and the rest moves into the menu.
+- The topbar is rendered server-side per viewer. It contains only counters, so it never goes into a shared cache (anonymous pages get an anonymous topbar, §6).
 
 ---
 
@@ -546,9 +707,9 @@ Anonymous visitors are covered by the same per-IP limits as everyone else. Their
 
 - **Auth**: argon2id, opaque session cookies (store only a hash), `HttpOnly; Secure; SameSite=Lax`, CSRF tokens on all forms, session rotation on login.
 - **Input**: markdown rendered with `pulldown-cmark` then sanitized with `ammonia`; strict CSP; parameterized queries only (sqlx).
-- **Uploads**: verify magic bytes (not the extension), re-encode images and strip EXIF, enforce size/duration caps (video max 50 MB), random storage keys, never serve from a user-controlled path.
+- **Uploads**: verify magic bytes (not the extension), re-encode images and strip EXIF, enforce the size/duration caps from `.env` (§13.2), random storage keys, never serve from a user-controlled path.
 - **Ops**: structured logs (`tracing`), `/healthz`, Prometheus metrics, Postgres backups (nightly `pg_dump` + WAL archiving), migrations via `sqlx migrate`.
-- **Visibility tests**: privacy is the easiest thing to leak by accident, so keep an automated test matrix of viewer type (owner, admin, approved follower, other user, mod, anonymous, blocked) × section toggle (on/off) × account type, run against every endpoint that returns posts, likes, follows, reposts or stories.
+- **Visibility tests**: privacy is the easiest thing to leak by accident, so keep an automated test matrix of viewer type (owner, admin, friend, follower who is not a friend, other user, mod, anonymous, blocked) × level (public / friends / private) × account setting vs per-post setting, run against every endpoint that returns posts, likes, follows, reposts, stories or notifications.
 - **Secrets**: `.env` locally, Docker/Swarm/Kubernetes secrets in production. Never commit `.env`.
 - **Operational note**: Ollama on CPU is slow. Moderation is async by design, so slowness delays *visibility*, not requests. Use a GPU for real traffic.
 
@@ -579,7 +740,9 @@ Anonymous visitors are covered by the same per-IP limits as everyone else. Their
 
 ---
 
-## 13. Running it
+## 13. Running and configuring it
+
+### 13.1 Running it
 
 ```bash
 cp .env.example .env        # set real secrets
@@ -589,41 +752,87 @@ docker compose up -d --scale app=4 && docker compose restart nginx   # more repl
 
 The `app`/`worker` images won't build until the Cargo workspace (`web` and `worker` binaries) and a `static/` directory exist. Postgres, Redis, RabbitMQ, Ollama and nginx can be brought up on their own: `docker compose up db redis rabbitmq ollama`.
 
+### 13.2 Global limits (`.env`)
+
+All limits are global settings read from `.env` at startup (change the value and restart `app` and `worker`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_VIDEO_SIZE_MB` | `50` | Largest accepted video upload |
+| `MAX_VIDEO_DURATION_SECS` | `600` | Longest accepted video (10 minutes) |
+| `MAX_IMAGE_SIZE_MB` | `50` | Largest accepted image upload |
+
+Size is enforced twice: by nginx (`client_max_body_size`, which must be at least the larger of the two size limits) and by the app, which gives the user a proper error message. Duration is checked in the app with `ffprobe` before the upload is accepted. Two consequences for the infrastructure: the `web` image needs `ffmpeg`/`ffprobe` added (today only the worker has it), and `nginx.conf` should be rendered from a template with the same value so the two can't drift apart (the nginx image supports `envsubst` templates).
+
+### 13.3 Feature flags (`.env`)
+
+Heavy or risky parts of the site can be switched off with a flag, mainly for development and load testing. All default to `true` unless noted.
+
+| Flag | What it controls | When off |
+|---|---|---|
+| `FEATURE_AI_MODERATION` | Ollama sensitive-content detection on media and post text (the heavy worker job) | The worker still makes thumbnails but skips Ollama and marks content `safe` with `moderation_model = 'disabled'`, so uploads show up immediately and those rows can be re-checked later |
+| `FEATURE_AI_VIDEO_ANALYSIS` | Keyframe extraction and AI analysis of videos (the heaviest part) | Videos skip analysis (marked `safe` / `disabled`), images are still checked |
+| `FEATURE_AI_CAPTIONS` | AI image descriptions (alt text and hidden description element) | No description is stored |
+| `FEATURE_EMBEDDINGS` | Caption embeddings and semantic search | Search falls back to keyword only |
+| `FEATURE_TRENDING_JOB` | The periodic job that computes Trending (§4.3) | `/trending` serves the last computed result or is empty |
+| `CACHE_ENABLED` | L1 (`moka`) and L2 (Redis) content caches | Every request hits Postgres; useful for debugging stale data |
+| `ANON_PAGE_CACHE` | nginx cache for anonymous pages (§6) | Anonymous visitors are served uncached |
+| `RATE_LIMIT_ENABLED` | App-level per-user rate limits (§9) | No app-level limits, for load tests |
+| `REGISTRATION_OPEN` | Whether `/register` accepts new accounts | Registration page shows "closed" |
+| `READ_ONLY_MODE` | Rejects every write (maintenance, migrations) | Site is browse-only |
+| `COOKIE_SECURE` | `Secure` attribute on the session cookie | Set `false` for plain-http local development only |
+| `DEV_SEED_DATA` (default `false`) | Loads fake users and posts on startup | |
+
+Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERATION_MODEL`, `OLLAMA_CAPTION_MODEL`, `OLLAMA_EMBED_MODEL`, `WORKER_CONCURRENCY`, `STORY_TTL_HOURS` (24), `NOTIFICATION_RETENTION_DAYS`.
+
+**Safety:** any flag that weakens moderation or security (`FEATURE_AI_MODERATION`, `FEATURE_AI_VIDEO_ANALYSIS`, `COOKIE_SECURE`) logs a warning at startup and shows a banner in the admin panel. Optionally the app can refuse to start with them off when `APP_ENV=production`, unless `ALLOW_UNSAFE_FLAGS=true` is also set.
+
+> `.env.example` and `docker-compose.yml` do not contain these variables yet.
+
 ---
 
 ## 14. Roadmap
 
 | Phase | Scope |
 |---|---|
-| 0 Foundations | Cargo workspace, compose stack up, migrations, `/healthz`, CI |
+| 0 Foundations | Cargo workspace, compose stack up, migrations, `/healthz`, CI, config loading for the `.env` limits and feature flags (§13) |
 | 1 Core | Register/login, sessions, profiles, settings, `/welcome/privacy` onboarding, anonymous browsing of public content, text posts + markdown, likes, basic follows |
-| 2 Privacy and social graph | `user_privacy` + visibility toggles, public → private popup, follow approval and `/follow-requests`, friends + friends feed, block and mute, the central `Viewer` visibility filter and its test matrix. Done early because every later query depends on it |
+| 2 Visibility and social graph | `user_privacy` with per-section levels (public / friends / private), per-post visibility, follow approval (with the pending-requests dialog), friends + friends feed, block and mute, the central `Viewer` / `can_view` filter and its test matrix. Done early because every later query depends on it |
 | 3 Threads and tags | `parent_id` replies, thread view, tags with chip UI, search by keyword |
-| 4 Media | Uploads (video max 50 MB), pipeline (thumbnail, NSFW, caption, embedding), hide-sensitive, semantic search |
-| 5 Extras | Stickers, polls, emoji autocomplete, reposts, stories, discover feed |
-| 6 Chat | WebSocket, persistence, Redis fan-out, read receipts, typing (with hide-typing setting), chat media |
-| 7 Moderation | Mod role, view-delete/restore (posts and stories), report post, AI flags on posts and the mod queue, admin panel, hard delete, audit log |
-| 8 Hardening | L1/L2 caching incl. anonymous page cache, app-level rate limits, metrics, backups, load testing |
-| 9 Scale | MinIO/S3, Postgres read replicas, dedicated search/GPU nodes if needed |
-| Maybe | Content compression worker, Kubernetes (see §15) |
+| 4 Media | Uploads (limits from `.env`), pipeline (thumbnail, NSFW, caption, embedding), hide-sensitive, semantic search |
+| 5 Extras | Stickers, polls, emoji autocomplete, reposts, stories, discover feed, trending |
+| 6 Notifications and topbar | `notifications`, bell popup, notification settings, system notices, announcements, topbar |
+| 7 Chat | WebSocket, persistence, Redis fan-out, read receipts, typing (with hide-typing setting), chat media, unread badge |
+| 8 Moderation | Mod role, view-delete/restore (posts and stories), report post, AI flags on posts and the mod queue, admin panel, hard delete, audit log |
+| 9 Hardening | L1/L2 caching incl. anonymous page cache, app-level rate limits, metrics, backups, load testing |
+| 10 Scale | MinIO/S3, Postgres read replicas, dedicated search/GPU nodes if needed |
+| Maybe | Transcode / compression worker, Kubernetes (see §15) |
 
 ---
 
 ## 15. Open questions and maybes
 
-### Decided in this revision
+### Decided
 
-Reposts, stories, anonymous browsing, public/private accounts with per-feature toggles, follow approval, friends and the friends feed, block and mute, post reports, AI sensitivity flags, the hide-typing-indicator setting and the 50 MB video cap are all part of the plan (§3 to §10). Earlier open questions on browsing, approval and block/mute/report are answered by them.
+Reposts, stories, anonymous browsing, follow approval, friends and the friends feed, block and mute, post reports, AI sensitivity flags, the hide-typing-indicator setting, notifications (separate from chat) and a Trending page are part of the plan (§3 to §10).
+
+- **Visibility** is three levels (`public`, `friends`, `private`) per account section and per post, replacing the old public/private switch. The account setting is the ceiling and a post can only narrow it (§3.2).
+- **Hidden things are not special-cased for followers.** Approved followers who are not friends see only `public` content (the old exception is gone).
+- **Muted accounts' replies** stay visible in threads. Mute only affects feeds, discover, search and the story tray (§3.5).
+- **Avatar** is always visible, even when everything else is private.
+- **Turning follow approval off** asks what to do with pending requests: stay pending (default), reject all, accept all (§3.4).
+- **Limits** are global and live in `.env`: video 50 MB and 10 minutes, image 50 MB (§13.2).
+- **Heavy features** can be switched off with flags in `.env` (§13.3).
 
 ### Open (the README currently assumes the default in brackets)
 
-1. **Do approved followers see hidden sections?** (Yes, but only when the owner has follow approval on; with approval off, a hidden toggle hides from everyone except the owner and admins.) Your notes say hidden stuff is visible to admins only, so confirm this exception for approved followers.
-2. **Replies from muted accounts in threads.** (Still shown; mute only affects feeds, discover, search and the story tray.)
-3. **Avatar on private profiles.** Your list of always-visible fields is name, username, bio and date joined. (Kept literally, so the avatar is hidden or replaced with a placeholder.)
-4. **Private → public behaviour.** (Only flips the flag; toggles are unchanged and pending follow requests stay pending.)
-5. **Video duration cap, image size cap, and whether to transcode on upload.** Only the 50 MB video size is decided.
+1. **Notifications from muted accounts.** (Still created; mute only quiets feeds, discover, search and stories. If you want mute to be quiet everywhere, suppress them.)
+2. **Per-story visibility.** Posts get a per-post level, stories only have the account-level `stories_visibility`. (Account level only. Adding a per-story level, e.g. a "friends only" story, is cheap if you want it.)
+3. **Mentions** (`@username`) are not in your feature list, but the notification type is proposed. (Included as a proposal; remove `mention` if you don't want mentions.)
+4. **Chat badge** counts unread conversations, not unread messages. (Conversations, capped at 99+.)
+5. **Suspended / banned users** can't use the site but see their notices on the suspension page at login. (As described in §8.2.)
 
 ### Maybe
 
-- **Compression worker**: a worker that compresses uploaded content (re-encode video, recompress images). It would also make the 50 MB cap easier to live with.
+- **Transcode / compression worker**: a worker that re-encodes video and recompresses images on upload. It would also make the size limits easier to live with.
 - **Hosting**: single VPS with Docker Compose now, Kubernetes later?
