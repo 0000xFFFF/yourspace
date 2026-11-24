@@ -18,10 +18,12 @@ A self-hosted social platform written in Rust. Server-rendered HTML, threaded po
 | Media storage | **Shared Docker volume**, served by nginx | Simple. Switch to MinIO/S3 when you outgrow a single host. |
 | Media/AI | **Ollama**: vision model for captions + text embedding model for search | Plus a dedicated NSFW classifier for the actual hide/show decision (see §7). |
 | Anonymous browsing | **Allowed**, read-only, public content only | Logged-out visitors see what the visibility rules allow (§3.3). Responses for visitors without a session cookie can be cached by nginx (§6). |
-| Privacy model | **Three levels (`public`, `friends`, `private`) per account section and per post** | No public/private account switch. The account setting is the ceiling and an individual post can only narrow it, so `private` posts setting + `public` post = private (§3.2). |
+| Privacy model | **Three levels (`public`, `friends`, `private`) per account section and per post** | No public/private account switch. The account setting is the ceiling and an individual post can only narrow it, so `private` posts setting + `public` post = private. Replies inherit the visibility of their thread's root post (§3.2). |
 | Notifications | **Own `notifications` table + bell popup, separate from chat** | Chat has its own icon and unread badge, so message floods never bury replies or requests. Repeated events are grouped (§8.2). |
 | Trending | **Separate page from Discover** | Trending is the same for everyone and cheap to cache; Discover is exploratory and personalized when logged in (§4.3). |
 | Limits and flags | **Global limits and feature flags in `.env`** | Video 50 MB / 10 min, image 50 MB, plus switches for heavy parts such as the AI moderation worker (§13). |
+| Mentions | **`@username` in posts, stored in `post_mentions`** | Renders as a link, notifies only people who may see the post, and respects a per-user `mention_policy` (§4.2). |
+| Bans | **Three kinds in one `bans` table**: account, soft IP, hard IP | Account ban view-deletes everything and is reversible; soft IP ban blocks login/register; hard IP ban is enforced in nginx so banned bots cost the app nothing (§3.7). |
 | Friends | **Derived, not stored** | Two accepted follows in opposite directions. No extra table to keep in sync (§3.4). |
 | Block / mute | **Separate `blocks` and `mutes` tables** | Block hides everything in both directions, mute only quiets feeds and stories (§3.5). |
 | Reports | **`reports` table + mod queue** | Users report posts, AI flags land in the same queue (§7). |
@@ -69,7 +71,7 @@ Suggested crates: `axum`, `tokio`, `tower-http`, `sqlx` (Postgres, compile-time 
 | Restore a view-deleted post | ❌ | ✅ | ✅ |
 | Hard-delete a post (row removed) | ❌ | ❌ | ✅ |
 | Admin panel | ❌ | ❌ | ✅ |
-| Edit any account (name, bio, pic, role, suspend), see who they follow | ❌ | ❌ | ✅ |
+| Edit any account (name, bio, pic, role, ban), see who they follow | ❌ | ❌ | ✅ |
 | See extra post info (IP/session, moderation labels, audit trail) | ❌ | ❌ | ✅ |
 | Repost, post stories, block / mute accounts | ✅ | ✅ | ✅ |
 | Report a post | ✅ | ✅ | ✅ |
@@ -77,6 +79,7 @@ Suggested crates: `axum`, `tokio`, `tower-http`, `sqlx` (Postgres, compile-time 
 | View-delete a story | ❌ | ✅ | ✅ |
 | See things an account restricted to `friends` or `private` (when not a friend) | ❌ (own account and friends only) | ❌ | ✅ |
 | Send site announcements and system notices | ❌ | ❌ | ✅ |
+| Ban accounts and IPs (account ban, soft IP ban, hard IP ban, §3.7) | ❌ | ❌ | ✅ |
 
 **View-delete** = `posts.deleted_at` is set. Normal queries use the `public_posts` view (`deleted_at IS NULL`); mods and admins query `posts` directly. **Hard delete** removes the row; `ON DELETE CASCADE` cleans up replies, likes, tags, media links. Every mod/admin action writes to `audit_log`.
 
@@ -98,7 +101,7 @@ Every restrictable thing has one of three levels (`visibility_level` enum):
 
 There is no separate "private account" switch. A "private account" is simply every section set to `private`; the registration page offers that as a preset (below).
 
-**Per-post visibility.** Each post also has its own `visibility` (`public | friends | private`), chosen in the composer and editable later. It is a different thing from the account setting, and they combine like this: **the account setting is the ceiling, and a post can only narrow it, never widen it.** The effective visibility is the stricter of the two:
+**Per-post visibility.** Each **thread-start post** also has its own `visibility` (`public | friends | private`), chosen in the composer and editable later. It is a different thing from the account setting, and they combine like this: **the account setting is the ceiling, and a post can only narrow it, never widen it.** The effective visibility is the stricter of the two:
 
 | Account `posts_visibility` | Post `visibility` | Effective |
 |---|---|---|
@@ -110,7 +113,11 @@ There is no separate "private account" switch. A "private account" is simply eve
 | private | public | **private** |
 | private | friends | **private** |
 
-So an account whose posts are `private` only has private posts, even if every single post is marked public. Effective visibility is computed at read time, so changing the account setting later applies to every existing post immediately, without rewriting rows. Replies follow the same rule (a reply is a post with its own `visibility`). New posts default to `public`, which means the account setting alone decides unless the author narrows a specific post.
+So an account whose posts are `private` only has private posts, even if every single post is marked public. Effective visibility is computed at read time, so changing the account setting later applies to every existing post immediately, without rewriting rows. New posts default to `public`, which means the account setting alone decides unless the author narrows a specific post.
+
+**Replies have no visibility of their own.** A reply always has the visibility of its **root post** (the thread start), and this cannot be changed per reply. The composer shows no selector for replies, only a note such as "Friends only, because the thread is friends only". If the root's effective visibility changes (the author edits the post or the account setting), the whole thread follows. Posting a reply requires being able to view the root. (`posts.visibility` is therefore only set on thread-start posts, see §4.2.)
+
+**Per-story visibility.** Stories work the same way as posts: each story has its own `visibility` (`public | friends | private`, default `public`, editable while the story is live), and the account's `stories_visibility` is the ceiling. The effective level is the stricter of the two, using the same table as above.
 
 **Reposts and likes.**
 
@@ -136,7 +143,7 @@ So an account whose posts are `private` only has private posts, even if every si
 
 A user who follows you but is not your friend counts as "any other user": they only see your `public` things.
 
-One predicate, `can_view(viewer, owner, level)`, is applied everywhere: profile tabs, feeds, trending, search, discover, direct post links and thread pages. For posts, `level` is the effective visibility from §3.2. A thread page requires being able to view the thread's root post. Replies the viewer may not see are shown as a collapsed "hidden reply" placeholder so the tree keeps its shape. Counters (like count, repost count, follower count) stay visible; the *lists* behind them follow the levels.
+One predicate, `can_view(viewer, owner, level)`, is applied everywhere: profile tabs, feeds, trending, search, discover, direct post links and thread pages. For posts, `level` is the effective visibility from §3.2. A thread page requires being able to view the thread's root post, and everyone who can view the root can view the whole thread (replies inherit the root's visibility, §3.2); only blocks and view-deletes hide individual replies. On the reply author's own profile, a reply is listed only if the viewer can see the thread **and** the author's `posts_visibility` allows them (assumption, see §15). Counters (like count, repost count, follower count) stay visible; the *lists* behind them follow the levels.
 
 ### 3.4 Following, approval and friends
 
@@ -164,6 +171,44 @@ Implementation: every query that returns posts, stories, users or messages goes 
 ### 3.6 Anonymous visitors
 
 Logged-out users can browse public content: home and discover feeds, public profiles, post and thread pages, tags and search. They are read-only (no likes, follows, reposts, polls, chat). They only ever see `public` things (§3.3). Visitors have no settings, so **sensitive media is hidden by default** and can be revealed with the "show" button. Anonymous traffic is rate limited per IP like any other page request (§9).
+
+### 3.7 Bans
+
+Three kinds, all issued by **admins** from `/admin/bans` and stored in one `bans` table (`kind`, a target, `reason`, `created_by`, optional `expires_at`, and `lifted_at` / `lifted_by`). A ban without `expires_at` is permanent. Every ban and lift is written to `audit_log`.
+
+| | Account ban | Soft IP ban | Hard IP ban |
+|---|---|---|---|
+| Target | One account | An IP address or CIDR range | An IP address or CIDR range |
+| Enforced by | The app | The app (`/login`, `/register`) | nginx, before the request reaches the app |
+| What it does | Revokes the account's sessions, blocks login, and view-deletes all its posts and stories | Blocks creating accounts and logging in from that IP | Blocks the IP from viewing the site at all |
+| What the person sees | A ban page at login with the reason and expiry | A message that they can't log in or register from this network | A static "access denied" page (HTTP 403), no app load |
+| Existing sessions | Revoked | Unaffected (use an account ban for existing accounts) | Cut off, since every request is refused |
+| Typical use | Rule-breaking users | Ban evasion, spam signups | Bots, scrapers, DoS |
+
+**Account ban**
+
+- Every post, reply and story of the account is **view-deleted** (`deleted_at` set, `delete_reason = 'account banned'`, `deleted_by` the admin) and tagged with `deleted_via_ban_id`. Lifting the ban (or its expiry) restores exactly the rows tagged with that ban id, and never anything that was deleted for another reason.
+- Its reposts, likes lists and stories disappear for every viewer. Its profile shows a "This account is banned" notice (name, username and avatar only). Mods and admins still see everything.
+- A view-deleted post that still has replies under it is shown to normal users as a "[deleted]" placeholder so the thread keeps its shape.
+- `users.is_banned` is kept in sync as a denormalized flag, so the per-request check is cheap.
+
+**Soft IP ban**
+
+- Checked on `/login`, `/register` and `/password-reset` against `bans` (cached in Redis).
+- Browsing is unaffected, because anonymous browsing is allowed.
+
+**Hard IP ban**
+
+- The app renders the active hard bans into an nginx include file (`geo $banned_ip { ... }`) on a volume shared with nginx. A small watcher script in the nginx container reloads nginx when the file changes (a delay of a few seconds). nginx then answers banned addresses with a minimal static 403 before any app, database or cache work happens.
+- This protects the app, not the network link: it stops application load but not a bandwidth or connection flood. For real DoS protection also use the host firewall or a CDN; the same list can feed them.
+- Idea: automatically hard-ban an IP for a while after it repeatedly hits the rate limits (HTTP 429).
+
+**Care with IP bans**
+
+- Shared IPs (university, office, mobile carrier NAT, VPN exit nodes) can hit innocent users. IP bans should usually have an `expires_at`, and the admin UI should show how many accounts have used the address.
+- For IPv6 ban the /64, not the single address.
+- nginx must see the real client IP (`real_ip_header` when behind a proxy or CDN), otherwise bans hit the proxy.
+- When banning an account the admin can optionally also add a soft IP ban for the addresses it recently used (from `sessions.ip`).
 
 ---
 
@@ -206,6 +251,13 @@ erDiagram
     POSTS ||--o{ NOTIFICATIONS : "about"
     USERS ||--o{ ANNOUNCEMENTS : writes
 
+    POSTS ||--o{ POST_MENTIONS : mentions
+    USERS ||--o{ POST_MENTIONS : "mentioned in"
+    USERS ||--o{ BANS : issues
+    USERS ||--o{ BANS : "target of"
+    BANS ||--o{ POSTS : hid
+    BANS ||--o{ STORIES : hid
+
     POSTS ||--o{ POSTS : "parent of"
     POSTS ||--o{ LIKES : receives
     POSTS ||--o{ POST_MEDIA : has
@@ -233,7 +285,7 @@ erDiagram
         text bio
         bigint avatar_media_id FK
         user_role role "user | mod | admin"
-        bool is_suspended
+        bool is_banned "synced from bans"
         int follower_count
         int following_count
         timestamptz created_at
@@ -245,6 +297,7 @@ erDiagram
         text language
         text theme
         bool hide_typing_indicator "hides mine and theirs in my chats"
+        text mention_policy "everyone | friends | nobody"
         jsonb extra
     }
     USER_PRIVACY {
@@ -292,7 +345,7 @@ erDiagram
         int depth
         text body_md
         text body_html "sanitized render"
-        visibility_level visibility "per post, can only narrow the account setting"
+        visibility_level visibility "thread starts only, replies follow the root"
         int like_count
         int reply_count
         int repost_count
@@ -301,6 +354,7 @@ erDiagram
         timestamptz deleted_at "view-delete marker"
         bigint deleted_by FK
         text delete_reason
+        bigint deleted_via_ban_id FK "set when an account ban hid it"
         sensitivity_state sensitivity "worst of text and media verdicts"
         jsonb moderation_labels "raw LLM output"
         text moderation_model
@@ -373,6 +427,8 @@ erDiagram
         timestamptz expires_at "created_at plus 24h"
         timestamptz deleted_at "view-delete marker"
         bigint deleted_by FK
+        bigint deleted_via_ban_id FK "set when an account ban hid it"
+        visibility_level visibility "can only narrow stories_visibility"
     }
     STORY_VIEWS {
         bigint story_id PK, FK
@@ -466,9 +522,25 @@ erDiagram
         timestamptz created_at
         timestamptz expires_at
     }
+    POST_MENTIONS {
+        bigint post_id PK, FK
+        bigint mentioned_user_id PK, FK
+    }
+    BANS {
+        bigint id PK
+        ban_kind kind "account | ip_soft | ip_hard"
+        bigint user_id FK "set for account bans"
+        cidr network "set for IP bans"
+        text reason
+        bigint created_by FK
+        timestamptz created_at
+        timestamptz expires_at "NULL = permanent"
+        timestamptz lifted_at
+        bigint lifted_by FK
+    }
 ```
 
-The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) is in [`schema.sql`](schema.sql). **Note:** `schema.sql` still describes the first version of the model. The tables and columns added in this revision (`user_privacy`, `reposts`, `stories`, `story_views`, `blocks`, `mutes`, `reports`, `notifications`, `notification_settings`, `announcements`, the `visibility_level` and `follow_status` enums, `follows.status`, `posts.visibility`, the `posts` moderation fields, `user_settings.hide_typing_indicator`) have to be added to it.
+The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) is in [`schema.sql`](schema.sql). **Note:** `schema.sql` still describes the first version of the model. The tables and columns added in this revision (`user_privacy`, `reposts`, `stories`, `story_views`, `blocks`, `mutes`, `reports`, `notifications`, `notification_settings`, `announcements`, the `visibility_level` and `follow_status` enums, `follows.status`, `posts.visibility` and `stories.visibility`, `posts.deleted_via_ban_id` and `stories.deleted_via_ban_id`, `post_mentions`, `bans` (with a `ban_kind` enum), `users.is_banned` (replacing `is_suspended`), the `posts` moderation fields, `user_settings.hide_typing_indicator` and `user_settings.mention_policy`) have to be added to it.
 
 ### 4.2 Modeling notes
 
@@ -483,10 +555,12 @@ The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) 
 - **Stickers** are `media` rows wrapped by `stickers`, allowed in posts (`post_stickers`) and chat (`messages.sticker_id`).
 - **IDs** are `BIGINT` identity columns (small indexes, keyset pagination). If you later want non-enumerable public IDs, add a separate `public_id` column rather than switching primary keys.
 - **Privacy**: `user_privacy` is a 1:1 table (one row per user, created at registration in the same transaction; every section starts as `private` until the welcome page is submitted). It is read on almost every request, so it is cached in `moka`/Redis and invalidated on change. Adding a section = new `visibility_level` column, backfilled with the strictest existing level (§3.2).
-- **Per-post visibility**: `posts.visibility` (default `public`) holds the author's choice for that post. The effective level is `stricter(user_privacy.posts_visibility, posts.visibility)`, computed at read time, so an account setting change needs no row rewrites. Queries for anonymous visitors, discover and trending filter on `visibility = 'public'` joined to the cached account level; if that join ever becomes a bottleneck, denormalize an `effective_visibility` column and recompute it in a background job when the account setting changes.
+- **Per-post visibility**: `posts.visibility` (default `public`) holds the author's choice for a **thread-start** post and is `NULL` on replies (a `CHECK` enforces that `visibility` is set exactly when `parent_id IS NULL`). The effective level of a thread-start post is `stricter(user_privacy.posts_visibility of its author, posts.visibility)`. A reply uses its root's effective level (a join through `root_id`), so it can't be changed per reply and follows the root automatically. Both are computed at read time, so an account-setting or root change needs no row rewrites. Queries for anonymous visitors, discover and trending filter on `visibility = 'public'` joined to the cached account level; if that join ever becomes a bottleneck, denormalize an `effective_visibility` column and recompute it in a background job when the account setting changes.
 - **Follows** carry a `status` (`pending` | `accepted`). A decline or a cancelled request deletes the row. **Friends** are never stored; they are the self-join of two `accepted` rows.
 - **Reposts**: a plain `(user_id, post_id)` row, no quote text. Reposts show up in feeds as "X reposted" and in the reposter's profile according to `reposts_visibility`. Only posts whose effective visibility is `public` can be reposted, because a repost would otherwise expose them outside the author's rules. If the original is later restricted, the repost disappears for viewers who can no longer see the original.
-- **Stories**: media-only (plus optional caption) posts that expire. `expires_at = created_at + 24h`; readers filter on `expires_at > now()`, and a worker purges expired rows and their media after a retention period. Stories go through the same media pipeline as posts, carry the same `deleted_at` view-delete marker, and `story_views` records who has seen each one.
+- **Stories**: media-only (plus optional caption) posts that expire. `expires_at = created_at + 24h`; readers filter on `expires_at > now()`, and a worker purges expired rows and their media after a retention period. Stories go through the same media pipeline as posts, carry the same `deleted_at` view-delete marker, and `story_views` records who has seen each one. Each story has its own `visibility` (default `public`) that can only narrow `user_privacy.stories_visibility`.
+- **Mentions**: `@username` (same pattern as usernames, `[A-Za-z0-9_]{3,32}`) in a post or reply. On write the server extracts mentions from `body_md` (ignoring code spans and code blocks), resolves them to existing users, stores them in `post_mentions` (unique per post and user) and renders them as profile links before sanitizing. At most `MAX_MENTIONS_PER_POST` (default 10) count. A mention notifies the user only if they can view the post, have not blocked the author, and their `mention_policy` (`everyone | friends | nobody`, default `everyone`, in `user_settings`) allows the author; the link is rendered either way. Editing a post only notifies for newly added mentions. The composer autocompletes `@` (friends and followees first) through an endpoint that applies blocks and is rate limited, like the `:emoji:` autocomplete.
+- **Bans**: one `bans` table for all three kinds (§3.7) with `CHECK` that exactly one of `user_id` / `network` is set (`user_id` for account bans, `network` of type `cidr` for IP bans). Posts and stories hidden by an account ban carry `deleted_via_ban_id`, so lifting the ban restores exactly those rows.
 - **Notifications**: one row per recipient and event, with `kind`, optional `actor_id` / `post_id`, a `data` JSON for display text, `read_at`, and a `group_key` + `count` for grouping. A partial unique index on `(recipient_id, group_key) WHERE read_at IS NULL AND group_key IS NOT NULL` makes the grouping an upsert. A partial index on `(recipient_id) WHERE read_at IS NULL` serves the unread counter. Chat is not stored here (§8.1). Site-wide updates live once in `announcements`.
 - **Blocks and mutes**: two small edge tables with composite primary keys and `CHECK (a <> b)`. Block is symmetric in effect but stored once, as `(blocker_id, blocked_id)`.
 - **Reports**: one row per `(reporter_id, post_id)` (unique), with `status` `open | resolved | dismissed`. Resolving can trigger a view-delete; both are written to `audit_log`.
@@ -503,7 +577,7 @@ The full DDL (types, constraints, indexes, thread trigger, `public_posts` view) 
 
 Fan-out on write (precomputed timelines) only becomes worthwhile when accounts have huge follower counts.
 
-Every feed applies the visibility predicate from §3.3 (effective post visibility, `reposts_visibility`) and the viewer's blocks and mutes. A follower who is not a friend therefore only sees `public` posts in the Following feed. Stories are not part of the feeds; they appear in a story tray built from followees with an unexpired story, minus blocked and muted accounts and accounts whose `stories_visibility` doesn't allow that viewer.
+Every feed applies the visibility predicate from §3.3 (effective post visibility, `reposts_visibility`) and the viewer's blocks and mutes. A follower who is not a friend therefore only sees `public` posts in the Following feed. Stories are not part of the feeds; they appear in a story tray built from followees with an unexpired story, minus blocked and muted accounts, and only including stories whose effective visibility (account level and per-story level, §3.2) allows that viewer.
 
 **Discover vs Trending.** They answer different questions, so they are separate pages:
 
@@ -602,15 +676,17 @@ The topbar has a bell icon that opens a popup with tabs **All | Requests | Repli
 | `new_follower` | Someone follows you (approval off) | `new_followers` | Shows a "follow back to become friends" shortcut |
 | `post_comment` | Someone replied directly to your thread-start post | `post_comments` | Grouped per post |
 | `comment_reply` | Someone replied to one of **your replies** | `comment_replies` | Grouped per comment |
-| `mention` | Someone wrote `@yourusername` | `mentions` | Needs mention parsing in posts |
-| `repost` | Someone reposted your post | `reposts` (default off) | Grouped per post |
-| `like` | Someone liked your post | `likes` (default off) | Grouped per post |
-| `poll_closed` | A poll you created or voted in closed | `poll_results` | |
+| `mention` | Someone wrote `@yourusername` in a post or reply you are allowed to see | `mentions` | Only for new mentions (an edit does not re-notify), see §4.2 |
+| `repost` * | Someone reposted your post | `reposts` (default off) | Grouped per post |
+| `like` * | Someone liked your post | `likes` (default off) | Grouped per post |
+| `poll_closed` * | A poll you created or voted in closed | `poll_results` | |
 | `system` | Moderation and site messages (below) | cannot be turned off | Pinned at the top |
+
+\* Proposed additions that were not in your original list; drop any you don't want.
 
 `friend requests` in the popup are the `follow_request` rows. Because friends are mutual follows (§3.4), a "friend request" is a follow request on an account with approval on, and the friendship exists once both directions are accepted.
 
-**System notices** (`system`, never suppressible): content removed by a mod (with the reason and a link to the rules), post marked sensitive by the AI filter, outcome of a report you filed, warning, account suspended / banned, role changed, security events (password changed, login from a new device), media rejected (too long / too large), terms of service updates. A suspended account is blocked from the site but is shown its notices on the suspension page at login.
+**System notices** (`system`, never suppressible): content removed by a mod (with the reason and a link to the rules), post marked sensitive by the AI filter, outcome of a report you filed, warning, account banned (also shown on the ban page at login), ban lifted, role changed, security events (password changed, login from a new device), media rejected (too long / too large), terms of service updates. A banned account is blocked from the site and is shown the ban reason and expiry on a ban page at login (§3.7).
 
 **Site updates** are stored once in `announcements` and merged into every user's list at read time (`announcements_seen_at` tracks what they've seen), instead of copying one row to every user.
 
@@ -638,7 +714,7 @@ The topbar has a bell icon that opens a popup with tabs **All | Requests | Repli
 | Friend / follow requests (`follow_requests`) | on |
 | Your follow request was accepted (`follow_accepted`) | on |
 | New followers (`new_followers`) | on |
-| Mentions (`mentions`) * | on |
+| Mentions (`mentions`) | on |
 | Reposts of your posts (`reposts`) * | off |
 | Likes on your posts (`likes`) * | off |
 | Poll results (`poll_results`) * | on |
@@ -657,7 +733,7 @@ Two layers:
    - login/register: **5 r/min**, burst 5
 2. **App-level, per user/session** (Redis counters, e.g. `governor`-style): posting, liking, following, DMs and uploads. IP limits alone punish shared networks and don't stop one logged-in account.
 
-Anonymous visitors are covered by the same per-IP limits as everyone else. Their cached responses (§6) mostly never reach the app, so the limits mainly protect uncached and logged-in traffic.
+Hard IP bans (§3.7) sit in front of both layers: nginx refuses banned addresses with a static 403 before any limiter or app work. Anonymous visitors are covered by the same per-IP limits as everyone else. Their cached responses (§6) mostly never reach the app, so the limits mainly protect uncached and logged-in traffic.
 
 > Interpretation: you wrote "tiny for media, bigger for pages". I read it as *media = very lenient limit, pages = tighter limit*. If you meant the opposite, swap the two `rate=` values.
 
@@ -671,14 +747,14 @@ Anonymous visitors are covered by the same per-IP limits as everyone else. Their
 |---|---|
 | Public (no login needed) | `/` (logged out: Discover), `/discover`, `/trending`, `/search?q=`, `/tag/:name`, `/p/:id` post + full thread, `/u/:username` profile (what the visibility levels allow) |
 | Auth | `/login`, `/register`, `/welcome/privacy` (presets + per-section visibility, shown right after registration) |
-| Posts | compose (markdown, media, stickers, poll, tags, **per-post visibility**), repost, report |
-| Stories | story tray, `/stories/:username`, create story |
+| Posts | compose (markdown, media, stickers, poll, tags, `@mention` autocomplete, **visibility selector on thread starts**; replies inherit the root's visibility), repost, report |
+| Stories | story tray, `/stories/:username`, create story (with visibility selector) |
 | Feeds | `/following` (logged-in home), `/friends` (mutual follows only), `/fyp` (later), `/discover`, `/trending` |
 | Notifications | topbar bell popup, `/notifications` |
-| Account | `/settings` (profile edit, hide sensitive, DM policy, theme, hide typing indicator), `/settings/privacy` (section visibility levels, follow approval), `/settings/notifications`, `/follow-requests`, `/blocked` (blocks and mutes), `/stickers` (create/manage) |
+| Account | `/settings` (profile edit, hide sensitive, DM policy, mention policy, theme, hide typing indicator), `/settings/privacy` (section visibility levels, follow approval), `/settings/notifications`, `/follow-requests`, `/blocked` (blocks and mutes), `/stickers` (create/manage) |
 | Chat | `/chat`, `/chat/:id`, `/ws` |
 | Mod | view-delete / restore on any post or story; report queue and AI-flagged posts |
-| Admin | `/admin` dashboard, `/admin/users/:id` (edit anything, role, suspend, follow list), `/admin/posts/:id` (extra info, hard delete), audit log, announcements |
+| Admin | `/admin` dashboard, `/admin/users/:id` (edit anything, role, ban, follow list), `/admin/bans` (create, list and lift account / soft IP / hard IP bans), `/admin/posts/:id` (extra info, hard delete), audit log, announcements |
 
 ### 10.2 Topbar
 
@@ -710,6 +786,7 @@ Anonymous visitors are covered by the same per-IP limits as everyone else. Their
 - **Uploads**: verify magic bytes (not the extension), re-encode images and strip EXIF, enforce the size/duration caps from `.env` (§13.2), random storage keys, never serve from a user-controlled path.
 - **Ops**: structured logs (`tracing`), `/healthz`, Prometheus metrics, Postgres backups (nightly `pg_dump` + WAL archiving), migrations via `sqlx migrate`.
 - **Visibility tests**: privacy is the easiest thing to leak by accident, so keep an automated test matrix of viewer type (owner, admin, friend, follower who is not a friend, other user, mod, anonymous, blocked) × level (public / friends / private) × account setting vs per-post setting, run against every endpoint that returns posts, likes, follows, reposts, stories or notifications.
+- **Bans**: the account-ban flag is checked on every authenticated request (cached `users.is_banned`), soft IP bans on `/login`, `/register` and `/password-reset`, and hard IP bans in nginx. All of them depend on seeing the real client IP, so test them behind whatever proxy or CDN production uses.
 - **Secrets**: `.env` locally, Docker/Swarm/Kubernetes secrets in production. Never commit `.env`.
 - **Operational note**: Ollama on CPU is slow. Moderation is async by design, so slowness delays *visibility*, not requests. Use a GPU for real traffic.
 
@@ -783,7 +860,7 @@ Heavy or risky parts of the site can be switched off with a flag, mainly for dev
 | `COOKIE_SECURE` | `Secure` attribute on the session cookie | Set `false` for plain-http local development only |
 | `DEV_SEED_DATA` (default `false`) | Loads fake users and posts on startup | |
 
-Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERATION_MODEL`, `OLLAMA_CAPTION_MODEL`, `OLLAMA_EMBED_MODEL`, `WORKER_CONCURRENCY`, `STORY_TTL_HOURS` (24), `NOTIFICATION_RETENTION_DAYS`.
+Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERATION_MODEL`, `OLLAMA_CAPTION_MODEL`, `OLLAMA_EMBED_MODEL`, `WORKER_CONCURRENCY`, `STORY_TTL_HOURS` (24), `NOTIFICATION_RETENTION_DAYS`, `MAX_MENTIONS_PER_POST` (10).
 
 **Safety:** any flag that weakens moderation or security (`FEATURE_AI_MODERATION`, `FEATURE_AI_VIDEO_ANALYSIS`, `COOKIE_SECURE`) logs a warning at startup and shows a banner in the admin panel. Optionally the app can refuse to start with them off when `APP_ENV=production`, unless `ALLOW_UNSAFE_FLAGS=true` is also set.
 
@@ -797,14 +874,14 @@ Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERA
 |---|---|
 | 0 Foundations | Cargo workspace, compose stack up, migrations, `/healthz`, CI, config loading for the `.env` limits and feature flags (§13) |
 | 1 Core | Register/login, sessions, profiles, settings, `/welcome/privacy` onboarding, anonymous browsing of public content, text posts + markdown, likes, basic follows |
-| 2 Visibility and social graph | `user_privacy` with per-section levels (public / friends / private), per-post visibility, follow approval (with the pending-requests dialog), friends + friends feed, block and mute, the central `Viewer` / `can_view` filter and its test matrix. Done early because every later query depends on it |
-| 3 Threads and tags | `parent_id` replies, thread view, tags with chip UI, search by keyword |
+| 2 Visibility and social graph | `user_privacy` with per-section levels (public / friends / private), per-post visibility (thread starts; replies inherit it), follow approval (with the pending-requests dialog), friends + friends feed, block and mute, the central `Viewer` / `can_view` filter and its test matrix. Done early because every later query depends on it |
+| 3 Threads, tags and mentions | `parent_id` replies (visibility inherited from the root), thread view, tags with chip UI, `@mentions` (parsing, `post_mentions`, autocomplete), search by keyword |
 | 4 Media | Uploads (limits from `.env`), pipeline (thumbnail, NSFW, caption, embedding), hide-sensitive, semantic search |
-| 5 Extras | Stickers, polls, emoji autocomplete, reposts, stories, discover feed, trending |
+| 5 Extras | Stickers, polls, emoji autocomplete, reposts, stories (with per-story visibility), discover feed, trending |
 | 6 Notifications and topbar | `notifications`, bell popup, notification settings, system notices, announcements, topbar |
 | 7 Chat | WebSocket, persistence, Redis fan-out, read receipts, typing (with hide-typing setting), chat media, unread badge |
-| 8 Moderation | Mod role, view-delete/restore (posts and stories), report post, AI flags on posts and the mod queue, admin panel, hard delete, audit log |
-| 9 Hardening | L1/L2 caching incl. anonymous page cache, app-level rate limits, metrics, backups, load testing |
+| 8 Moderation | Mod role, view-delete/restore (posts and stories), report post, AI flags on posts and the mod queue, admin panel, hard delete, audit log, bans (account and soft IP) |
+| 9 Hardening | L1/L2 caching incl. anonymous page cache, app-level rate limits, hard IP bans in nginx (generated blocklist + reload watcher), metrics, backups, load testing |
 | 10 Scale | MinIO/S3, Postgres read replicas, dedicated search/GPU nodes if needed |
 | Maybe | Transcode / compression worker, Kubernetes (see §15) |
 
@@ -817,7 +894,11 @@ Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERA
 Reposts, stories, anonymous browsing, follow approval, friends and the friends feed, block and mute, post reports, AI sensitivity flags, the hide-typing-indicator setting, notifications (separate from chat) and a Trending page are part of the plan (§3 to §10).
 
 - **Visibility** is three levels (`public`, `friends`, `private`) per account section and per post, replacing the old public/private switch. The account setting is the ceiling and a post can only narrow it (§3.2).
-- **Hidden things are not special-cased for followers.** Approved followers who are not friends see only `public` content (the old exception is gone).
+- **Replies inherit the root post's visibility** and it cannot be changed per reply (§3.2).
+- **Stories have a per-story visibility** (`public | friends | private`) like posts, capped by the account's `stories_visibility` (§3.2).
+- **Mentions** (`@username`) are a feature, with a `mention` notification and a `mention_policy` setting (§4.2, §8.2).
+- **Three kinds of bans**: account ban (view-deletes everything, reversible), soft IP ban (blocks login and registration), hard IP ban (blocks the IP from the site, enforced in nginx) (§3.7).
+- **Hidden things are not special-cased for followers.** Followers who are not friends see only `public` content.
 - **Muted accounts' replies** stay visible in threads. Mute only affects feeds, discover, search and the story tray (§3.5).
 - **Avatar** is always visible, even when everything else is private.
 - **Turning follow approval off** asks what to do with pending requests: stay pending (default), reject all, accept all (§3.4).
@@ -827,12 +908,37 @@ Reposts, stories, anonymous browsing, follow approval, friends and the friends f
 ### Open (the README currently assumes the default in brackets)
 
 1. **Notifications from muted accounts.** (Still created; mute only quiets feeds, discover, search and stories. If you want mute to be quiet everywhere, suppress them.)
-2. **Per-story visibility.** Posts get a per-post level, stories only have the account-level `stories_visibility`. (Account level only. Adding a per-story level, e.g. a "friends only" story, is cheap if you want it.)
-3. **Mentions** (`@username`) are not in your feature list, but the notification type is proposed. (Included as a proposal; remove `mention` if you don't want mentions.)
-4. **Chat badge** counts unread conversations, not unread messages. (Conversations, capped at 99+.)
-5. **Suspended / banned users** can't use the site but see their notices on the suspension page at login. (As described in §8.2.)
+2. **Chat badge** counts unread conversations, not unread messages. (Conversations, capped at 99+.)
+3. **Does the reply author's own `posts_visibility` apply to their replies?** (Not inside the thread, where only the root's visibility counts. On the author's profile a reply is listed only if the viewer can see the thread and the author's `posts_visibility` also allows them.)
+4. **Who can ban?** (Admins only. Mods keep view-delete. Should mods be able to issue temporary account bans?)
+5. **Hard-ban response.** (A static 403 page, so a wrongly banned human can see what happened. The alternative is closing the connection silently with nginx `444`, better against bots.)
+6. **What a banned account's profile shows.** (A "This account is banned" notice with name, username and avatar, and no content.)
+7. **Mention defaults.** (`mention_policy` defaults to `everyone`, and at most 10 mentions count per post.)
 
 ### Maybe
 
 - **Transcode / compression worker**: a worker that re-encodes video and recompresses images on upload. It would also make the size limits easier to live with.
 - **Hosting**: single VPS with Docker Compose now, Kubernetes later?
+
+---
+
+## 16. Ideas and gaps (proposals, not part of the plan yet)
+
+Things I think are missing. Nothing here is decided, and none of it is reflected in the data model above.
+
+**Worth fixing before launch**
+
+- **Email.** `/password-reset` exists as a route, but nothing in the plan sends mail. It needs SMTP or a provider, email verification, and optionally notification emails. Along with it: two-factor login (TOTP) and a "your sessions" page where users can see and revoke logins.
+- **Anti-bot signup.** A CAPTCHA (e.g. Cloudflare Turnstile or hCaptcha) on `/register`, and stricter limits for brand-new accounts (posting rate, links, mentions, DMs to non-friends) that relax as the account ages.
+- **Account deletion and data export.** User-initiated deletion with a grace period, then a purge of rows and media files, plus an export of the user's own data. Legally required in many regions.
+- **Terms and policies.** Terms of Service, Privacy Policy, cookie notice and a minimum-age checkbox at registration. Store `terms_version` / `terms_accepted_at` per user so a "terms updated" notice (§8.2) can require re-acceptance. A copyright takedown process.
+- **Appeals and strikes.** A form for appealing a removal or ban that creates a ticket for admins, mod notes on a user, and a strike system (warning, temporary ban, ban) built on the three ban kinds.
+- **Reports beyond posts.** Report users, stories, comments and chat messages, not only posts.
+- **Cleanup and quotas.** A job that deletes unreferenced media files, and a per-user storage cap.
+
+**Nice to have**
+
+- **Social features:** bookmarks, pinning a post on your profile, following a tag, quote reposts, post edit history, drafts and scheduled posts, a "close friends" list as a fourth visibility level for posts and stories, a verified badge, a profile banner.
+- **Safety tools:** muted words and tags, a "restrict" option softer than block, a message-requests inbox for DMs from non-friends, author-set "sensitive / spoiler" marks in addition to the AI flag, and author-written alt text that overrides the AI description.
+- **Sharing and SEO:** Open Graph / Twitter card meta so shared links to public posts and profiles preview nicely, `robots.txt`, a sitemap, `noindex` for anything that is not public, and RSS for public profiles. Anonymous browsing makes these worthwhile.
+- **Operations:** an admin dashboard with abuse and queue statistics, regularly tested backup restores, alerts (queue depth, Ollama latency, 5xx rate), partitioning for `messages` and `notifications` when they grow, UI translations (there is a `language` setting but no translation plan), and an accessibility pass (keyboard use, contrast).
