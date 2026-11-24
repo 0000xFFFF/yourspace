@@ -320,9 +320,9 @@ sequenceDiagram
     A->>A: validate magic bytes, size, strip EXIF
     A->>D: INSERT media (sensitivity = pending)
     A->>Q: publish media.process {media_id}
-    A-->>U: post created (media shown as "processing")
+    A-->>U: post created, media shown as processing
     Q->>W: media.process
-    W->>W: thumbnail; video: ffmpeg keyframes
+    W->>W: thumbnail, and for video ffmpeg keyframes
     W->>W: NSFW classifier on image / frames
     W->>O: caption (vision model)
     W->>O: embed caption
