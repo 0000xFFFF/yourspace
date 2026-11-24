@@ -1,0 +1,14 @@
+# PostgreSQL 17 with pgvector (semantic search over image/video descriptions).
+# pg_trgm and citext ship with the contrib package already in the base image.
+FROM pgvector/pgvector:pg17
+
+# Runs only when the data volume is empty. After that, use sqlx migrations.
+COPY schema.sql /docker-entrypoint-initdb.d/001_schema.sql
+
+EXPOSE 5432
+
+CMD ["postgres", \
+     "-c", "max_connections=200", \
+     "-c", "shared_buffers=512MB", \
+     "-c", "effective_cache_size=1536MB", \
+     "-c", "log_min_duration_statement=250"]

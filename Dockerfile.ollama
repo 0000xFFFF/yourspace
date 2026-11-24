@@ -1,0 +1,15 @@
+FROM ollama/ollama:latest
+
+# Space-separated list of models pulled on first start (override via compose/.env).
+ENV PULL_MODELS="moondream nomic-embed-text"
+
+COPY ollama-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 11434
+
+# Healthy only after every model in PULL_MODELS has been pulled.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=300s --retries=20 \
+  CMD test -f /tmp/models-ready || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]

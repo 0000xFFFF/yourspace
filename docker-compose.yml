@@ -1,0 +1,123 @@
+name: yourspace
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379
+  AMQP_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f
+  OLLAMA_URL: http://ollama:11434
+  MEDIA_DIR: /data/media
+  SESSION_SECRET: ${SESSION_SECRET}
+  RUST_LOG: ${RUST_LOG:-info}
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # volatile-lru: only keys with a TTL (cache entries, rate-limit counters) can be evicted
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # management UI is not published; to peek: add  ports: ["127.0.0.1:15672:15672"]
+
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    restart: unless-stopped
+    environment:
+      PULL_MODELS: ${PULL_MODELS:-moondream nomic-embed-text}
+    volumes:
+      - ollamadata:/root/.ollama
+    # NVIDIA GPU (needs nvidia-container-toolkit) - uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+      target: web
+    restart: unless-stopped
+    environment: *app-env
+    volumes:
+      - media:/data/media
+    deploy:
+      replicas: 2
+    depends_on:
+      db:       { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+      target: worker
+    restart: unless-stopped
+    environment: *app-env
+    volumes:
+      - media:/data/media
+    depends_on:
+      db:       { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      ollama:   { condition: service_healthy }
+
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - media:/srv/media:ro
+    depends_on:
+      - app
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmqdata:
+  ollamadata:
+  media:
