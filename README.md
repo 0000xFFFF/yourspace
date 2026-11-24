@@ -8,6 +8,7 @@ my social media platform
         - postgres (db)
         - my app (rust)
         - nginx (balance loader)
+        - ollama (models for auto content moderation - images/videos hide senitive content for users that enabled in their settings)
     - make docker compose file that runs everything
 - written in rust
 - postgres or neo4j (need to plan db)
@@ -21,6 +22,7 @@ my social media platform
 
 ## pages
 - accounts (bio, pic, posts, ...)
+- user settings (hide sensitive content, etc, etc)
 a.k.a users
     - can be: normal users, mods, admins
 - mods can 'view delete' posts (view delete: just means post is marked as deleted and normal users can't view them: mods and admins can)
