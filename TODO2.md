@@ -2,3 +2,4 @@
     - by default saved posts are in a the default "*" collection
     - when saving you can create a collection and name it 
 - remove note in schema.sql we will generate once we finish the README.me spec
+- all other files we made, like docker compose, just give me a tldr in README.md what each file does
