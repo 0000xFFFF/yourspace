@@ -1,0 +1,42 @@
+# need to change in docs
+- add reposts as a feature
+- add stories as a feature
+- allow anonymous browsing
+- users can set their account to private (hides everything except name,username,bio,date joined)
+- public show everything
+    - public accounts can hide stuff manually:
+        - posts
+        - likes
+        - follows
+        - reposts
+        - stories
+
+- add follow approval option for users
+    - private account -> implies you need to approve follow
+        - only when a user changes from public -> private
+            - there will be a popup settings with all the toggles what happens to account
+                - hide posts
+                - hide likes
+                - hide follows
+                - hide reposts
+                - stories
+                - etc
+
+- add hide typing indicator setting (this will hide their indicator it also hides the indicator for accounts that they are talking to)
+- if both accounts follow each other they are 'friends'
+- add friends feed - only show posts from friends
+- only admins can see profile posts/likes/follows/... from private accounts mods can't
+- when you register redirect user to a page that allows setting public/private status
+- both private and public accounts can show and hide stuff it depends entirely on the individual setting
+    - it just implies when a new feature is added private accounts will hide their stuff while public will show
+        - so we can have a private account that shows everything
+- add block and mute feature for accounts
+- mute just hides stories and posts
+- block hides everything, you can't even see them in a comment section
+- add report post feature
+- ai LLMs needs to flag posts for sensitive content so we also make sure we have those fileds 
+- add video limit size max 50mb
+
+- keep these as a maybe:
+    - add a feature wokerer that compresses content
+    - single VPS with Docker Compose, or Kubernetes later?
