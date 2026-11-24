@@ -38,6 +38,9 @@ a.k.a users
     - videos
     - image
     - simple markdown posts styling
+    - every post can be a thread
+        - can have children posts which can have children and so on
+        - so every post should have a parent field (it's null if it's a thread start) 
     - making a post with video/image gens content description
       (add to hidden html element robots can see element or user with inspect element)
     - stickers
