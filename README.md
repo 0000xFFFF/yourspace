@@ -41,6 +41,7 @@ a.k.a users
     - making a post with video/image gens content description
       (add to hidden html element robots can see element or user with inspect element)
     - stickers
+    - poll (users can create and vote on polls)
     - make tags (optional/searchable for posts)
         - when user types "#something " space take that text put a span/div in the bottom with [x] to remove tag
 - likes, followers
