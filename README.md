@@ -1,6 +1,6 @@
 # yourspace
 
-A self-hosted social platform written in Rust. Server-rendered HTML, threaded posts, reposts and stories, public / friends-only / private visibility for each part of an account and for each individual post, notifications, media with automatic sensitive-content filtering, realtime chat, and a mod/admin toolset. Anyone can browse public content without an account. Everything runs in Docker.
+A self-hosted social platform written in Rust. Server-rendered HTML, threaded posts, reposts, stories and saved posts, public / friends-only / private visibility for each part of an account and for each individual post, notifications, media with automatic sensitive-content filtering, realtime chat, and a mod/admin toolset. Anyone can browse public content without an account. Everything runs in Docker.
 
 ---
 
@@ -10,7 +10,7 @@ A self-hosted social platform written in Rust. Server-rendered HTML, threaded po
 |---|---|---|
 | Database | **PostgreSQL** (+ `pgvector`, `pg_trgm`) | Your data is relational. Follows are a 1-hop edge table, threads are a `parent_id` tree. Postgres also gives you full-text search, vector search, transactions for counters/polls and one thing to back up. Neo4j adds a second store that must be kept in sync, for graph queries you don't have yet. |
 | Neo4j? | **Not now** | Revisit only for "people you may know" / graph recommendations at very large edge counts. It can be added later as a read-only projection fed from Postgres. |
-| Message queue | **RabbitMQ for background jobs only** | Moderation, captioning, embeddings, thumbnails, transcoding. Not for chat delivery. |
+| Message queue | **RabbitMQ for background jobs only** | Moderation, captioning, embeddings, thumbnails, transcoding, outgoing email, data exports and account purges. Not for chat delivery. |
 | Realtime chat | **WebSocket on the app + Redis pub/sub** | App is horizontally scaled, so a message received by replica A must reach a user connected to replica B. Messages are persisted in Postgres first, then published. |
 | Cache | **Both, layered**: `moka` (in-process L1) + **Redis** (shared L2) | L1 is nanoseconds but per-replica. L2 is shared across replicas and also holds rate-limit state and pub/sub. See §6. |
 | Load balancer | **nginx** (don't write your own) | Battle-tested, handles WebSocket upgrade, rate limiting, caching and `X-Accel-Redirect` file serving. |
@@ -174,10 +174,13 @@ Logged-out users can browse public content: home and discover feeds, public prof
 
 ### 3.7 Bans
 
-Three kinds, all issued by **admins** from `/admin/bans` and stored in one `bans` table (`kind`, a target, `reason`, `created_by`, optional `expires_at`, and `lifted_at` / `lifted_by`). A ban without `expires_at` is permanent. Every ban and lift is written to `audit_log`.
+Three kinds of ban, stored in one `bans` table (`kind`, a target, `reason`, `created_by`, optional `expires_at`, and `lifted_at` / `lifted_by`). A ban without `expires_at` is permanent, and a reason is required. Every ban and lift is written to `audit_log`.
+
+**Account bans are the everyday tool and can be issued by mods and admins. IP bans (soft and hard) are rarely needed and only admins can issue them.**
 
 | | Account ban | Soft IP ban | Hard IP ban |
 |---|---|---|---|
+| Who can issue it | Mods and admins | Admins only | Admins only |
 | Target | One account | An IP address or CIDR range | An IP address or CIDR range |
 | Enforced by | The app | The app (`/login`, `/register`) | nginx, before the request reaches the app |
 | What it does | Revokes the account's sessions, blocks login, and view-deletes all its posts and stories | Blocks creating accounts and logging in from that IP | Blocks the IP from viewing the site at all |
@@ -187,17 +190,21 @@ Three kinds, all issued by **admins** from `/admin/bans` and stored in one `bans
 
 **Account ban**
 
-- Every post, reply and story of the account is **view-deleted** (`deleted_at` set, `delete_reason = 'account banned'`, `deleted_by` the admin) and tagged with `deleted_via_ban_id`. Lifting the ban (or its expiry) restores exactly the rows tagged with that ban id, and never anything that was deleted for another reason.
-- Its reposts, likes lists and stories disappear for every viewer. Its profile shows a "This account is banned" notice (name, username and avatar only). Mods and admins still see everything.
-- A view-deleted post that still has replies under it is shown to normal users as a "[deleted]" placeholder so the thread keeps its shape.
+- **Who may ban whom:** a mod can ban and unban normal users, but not other mods or admins. A mod can lift only bans that mods issued; a ban issued by an admin can only be lifted by an admin. Admins can ban anyone.
+- Every post, reply and story of the account is **view-deleted** (`deleted_at` set, `delete_reason = 'account banned'`, `deleted_by` the mod or admin who banned) and tagged with `deleted_via_ban_id`. Lifting the ban (or its expiry) restores exactly the rows tagged with that ban id, and never anything that was deleted for another reason.
+- **Normal users and anonymous visitors cannot find a banned account.** It is left out of user search, mention autocomplete, suggestions, follower and following lists, and none of its posts show up in search, feeds, trending or discover. A view-deleted post that still has replies under it is shown as a "[deleted]" placeholder so the thread keeps its shape.
+- **Going straight to `/u/:username` always renders "This account has been banned"** for everyone except mods and admins, whatever the account's visibility levels are. Nothing else about the account (name, avatar, bio) is shown.
+- **Mods and admins can find banned accounts and their deleted posts.** Search has a staff-only toggle, "Include banned accounts and deleted posts" (§5). Mods and admins who open the profile see it normally with a "banned" banner, the ban reason and the account's view-deleted content. Mods still follow the visibility levels (§3.3), so anything the account restricted to `friends` or `private` stays admin-only.
+- Its reposts, likes lists and stories disappear for every viewer.
 - `users.is_banned` is kept in sync as a denormalized flag, so the per-request check is cheap.
+- A banned account cannot log in, so it also cannot disable or delete itself while banned.
 
-**Soft IP ban**
+**Soft IP ban** (admins only)
 
 - Checked on `/login`, `/register` and `/password-reset` against `bans` (cached in Redis).
 - Browsing is unaffected, because anonymous browsing is allowed.
 
-**Hard IP ban**
+**Hard IP ban** (admins only)
 
 - The app renders the active hard bans into an nginx include file (`geo $banned_ip { ... }`) on a volume shared with nginx. A small watcher script in the nginx container reloads nginx when the file changes (a delay of a few seconds). nginx then answers banned addresses with a minimal static 403 before any app, database or cache work happens.
 - This protects the app, not the network link: it stops application load but not a bandwidth or connection flood. For real DoS protection also use the host firewall or a CDN; the same list can feed them.
@@ -208,7 +215,56 @@ Three kinds, all issued by **admins** from `/admin/bans` and stored in one `bans
 - Shared IPs (university, office, mobile carrier NAT, VPN exit nodes) can hit innocent users. IP bans should usually have an `expires_at`, and the admin UI should show how many accounts have used the address.
 - For IPv6 ban the /64, not the single address.
 - nginx must see the real client IP (`real_ip_header` when behind a proxy or CDN), otherwise bans hit the proxy.
-- When banning an account the admin can optionally also add a soft IP ban for the addresses it recently used (from `sessions.ip`).
+- When banning an account a mod or admin can optionally flag the addresses it recently used (from `sessions.ip`) for an admin to soft-ban.
+
+### 3.8 Account lifecycle
+
+An account is always in one of these states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unconfirmed: register
+    Unconfirmed --> Active: email confirmed
+    Active --> Disabled: disable account
+    Disabled --> Active: log in
+    Active --> DeletionPending: delete permanently
+    DeletionPending --> Active: log in and cancel
+    DeletionPending --> Purged: grace period over
+    Active --> Banned: account ban
+    Banned --> Active: ban lifted or expired
+    Purged --> [*]
+```
+
+**Email confirmation**
+
+1. **Validation before registering.** The form checks the address on the frontend (`type="email"` plus a simple pattern, for instant feedback) and the backend checks it again and is authoritative: trim, maximum 254 characters, parse with a strict address parser (e.g. the `lettre` or `email_address` crate), lowercase the domain, and reject duplicates (`users.email` is a unique `citext`). A syntactically valid address can still be wrong, so only the confirmation email proves it.
+2. **Registration** creates the account with `email_confirmed = false` and signs the user in, but an unconfirmed account is treated **exactly like an anonymous visitor**: read-only, no posting, likes, follows, chat or notifications, and every other page redirects to `/confirm-email`. It has no public profile and does not appear in search.
+3. **The email** is queued on RabbitMQ and sent by the worker over SMTP. It contains a link `PUBLIC_BASE_URL/confirm-email?token=<hex>`. The token is at least 32 random bytes from the OS random generator, hex-encoded (64+ characters). Only its SHA-256 hash is stored (`email_confirmations`). Tokens have **no expiration**, are single-use, and only work while the account's email is still the address the link was sent to.
+4. **The `/confirm-email` page** shows the address and a **Resend confirmation email** button (each resend creates a new token; older ones stay valid because there is no expiry; a cooldown of `EMAIL_RESEND_COOLDOWN_SECS` and the auth rate limit prevent abuse). It also has a **Wrong address? Change email** form (my addition) which validates the new address, replaces it, invalidates links sent to the old one and sends a new email; without it a typo would lock a user out for good.
+5. **The page waits for the server.** It listens for an `email.confirmed` event (pushed through Redis pub/sub to the user's `/ws` connection) and falls back to polling `GET /confirm-email/status` every 3 seconds.
+6. **When the user clicks the link** (in any browser or on any device) the server sets `email_confirmed = true`, marks the token used and publishes the event. The waiting page then redirects to `/welcome/privacy`, the welcome guide where the user picks the public / friends / private options (§3.2). If the link was opened somewhere else, that page just says "Email confirmed".
+7. **The welcome guide can be skipped.** Skipping goes straight to the user's own profile and keeps the safe defaults (every section `private`); the profile shows a reminder banner while everything is private.
+8. For local development `REQUIRE_EMAIL_CONFIRMATION=false` confirms accounts automatically, and a mail catcher container can stand in for SMTP (§13.4). Optionally `UNCONFIRMED_ACCOUNT_TTL_DAYS` deletes accounts that never confirmed so they don't hold usernames forever (default: never).
+
+**Disable account (reversible)**
+
+- In `/settings/account` the user can **disable** the account (password required). It logs them out of every session and sets `users.disabled_at`.
+- While disabled the account is **hidden from the site**: its profile shows "This account is not available" and everything it made (posts, replies, stories, reposts, likes lists, follows) is hidden from everyone, mods included. Admins can see its state in the admin panel.
+- **Logging in again brings it back**: a successful login clears `disabled_at` and shows "Welcome back, your account is active again".
+- It works by a join, not by rewriting rows (§4.2, Account state), which is why reactivation is instant. This is different from a ban, which view-deletes rows.
+- Details: replies in other people's threads show as a "[not available]" placeholder if they have children, otherwise they vanish; like and repost counters are not recomputed; direct messages the user sent stay visible to the other person, who sees an "Unavailable user" and cannot message them (assumption, §15); the account is left out of search, trending, discover and mention autocomplete.
+
+**Permanent deletion (irreversible after a grace period)**
+
+- In `/settings/account` → **Delete account permanently**: the user re-enters the password and types their username. The dialog lists the consequences and links to **Download my data** first.
+- This sets `delete_requested_at`. During the grace period (`ACCOUNT_DELETION_GRACE_DAYS`, default 30) the account behaves exactly like a disabled one and the email address stays reserved. Logging in shows "This account is scheduled for deletion on <date>" with **Cancel deletion** (restores the account) and **Log out**.
+- When the grace period is over, a worker job **purges** the account: it collects the account's media file keys, deletes the `users` row in one transaction, deletes the files, recomputes the denormalized counters it affected, and writes an `audit_log` entry that contains no personal data.
+- `ON DELETE CASCADE` removes the account's posts (and therefore every reply under them, **including replies written by other people**), its replies elsewhere, stories, reposts, likes, follows, blocks and mutes, sessions, settings, notifications, saved collections, and the messages it sent. The username and email become free again. Backups keep the data until they rotate out, which the privacy policy should state.
+
+**Data export**
+
+- In `/settings/account` → **Download my data** (password required). A worker builds a ZIP with JSON files for the profile, settings, posts, replies, likes, reposts, saved posts and collections, follows, blocks and mutes, stories and the messages the user sent, plus a `media/` folder with their uploaded files.
+- When it is ready the user gets a `data_export_ready` system notification with a download link. The file is stored under `MEDIA_DIR/exports/`, served only to its owner (through `X-Accel-Redirect`) and deleted after `DATA_EXPORT_TTL_DAYS` (default 7). One export per 24 hours, one at a time, tracked in `data_exports`.
 
 ---
 
@@ -792,13 +848,40 @@ Hard IP bans (§3.7) sit in front of both layers: nginx refuses banned addresses
 
 ---
 
-## 12. Repository layout
+## 12. Repository layout and files
+
+### 12.1 What each file does (TL;DR)
+
+**Files in the repository today**
+
+| File | What it does |
+|---|---|
+| `README.md` | This document: the spec for the whole platform (stack, data model, rules, roadmap). |
+| `TODO.md` | Your original raw brainstorm of features and tech stack that this README was built from. |
+| `yourspace-plan1.md` | An earlier, standalone planning document (product overview, architecture, roadmap). This README is the current spec; the old plan is background. |
+| `LICENSE` | MIT license. |
+| `docker-compose.yml` | Starts the whole stack: `db` (Postgres), `redis`, `rabbitmq`, `ollama`, `app` (the web server, 2 replicas), `worker` and `nginx` (the only published port, 80). Wires them together with health checks, shared volumes (`pgdata`, `redisdata`, `rabbitmqdata`, `ollamadata`, `media`) and the environment variables the Rust binaries read. |
+| `env.example` | Template for `.env` (copy it): database and RabbitMQ credentials, `SESSION_SECRET`, which Ollama models to pull, and the log level. |
+| `Dockerfile.app` | Builds the Rust workspace once (with dependency caching) and produces two images from it: **`web`** (HTTP / WebSocket server, health-checked on `/healthz`) and **`worker`** (RabbitMQ consumer, includes `ffmpeg`). |
+| `Dockerfile.postgres` | PostgreSQL 17 with `pgvector` (`citext` and `pg_trgm` come with it); loads `schema.sql` on first start and sets a few performance flags. |
+| `Dockerfile.nginx` | nginx image that bakes in `nginx.conf` and has a health check. |
+| `Dockerfile.ollama` | Ollama image whose entrypoint pulls the models listed in `PULL_MODELS` and only reports healthy once they are ready. |
+| `ollama-entrypoint.sh` | The script behind that: starts `ollama serve`, waits for the API, pulls each model, then marks the container ready. |
+| `nginx.conf` | Load balancer and front door: spreads traffic over the `app` replicas, rate limits (pages, media, login), proxies WebSockets, caches `/static/`, and serves protected media files after the app authorizes them (`X-Accel-Redirect`). |
+| `schema.sql` | The first version of the PostgreSQL schema. It will be regenerated from this spec once the spec is final. |
+
+**Files to be created** (see the layout below): `Cargo.toml` and `crates/` (the Rust code), `templates/` (HTML templates), `static/` (CSS, JS, built-in stickers).
+
+### 12.2 Layout
 
 ```
 .
 ├── README.md
+├── TODO.md
+├── yourspace-plan1.md
+├── LICENSE
 ├── docker-compose.yml
-├── .env.example
+├── env.example
 ├── Dockerfile.app          # targets: web, worker
 ├── Dockerfile.postgres
 ├── Dockerfile.nginx
@@ -873,17 +956,18 @@ Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERA
 | Phase | Scope |
 |---|---|
 | 0 Foundations | Cargo workspace, compose stack up, migrations, `/healthz`, CI, config loading for the `.env` limits and feature flags (§13) |
-| 1 Core | Register/login, sessions, profiles, settings, `/welcome/privacy` onboarding, anonymous browsing of public content, text posts + markdown, likes, basic follows |
+| 1 Core | Register/login, email confirmation (SMTP, `/confirm-email`, unconfirmed accounts behave as anonymous), sessions, profiles, settings, `/welcome/privacy` welcome guide, anonymous browsing of public content, text posts with simple formatting, likes, basic follows |
 | 2 Visibility and social graph | `user_privacy` with per-section levels (public / friends / private), per-post visibility (thread starts; replies inherit it), follow approval (with the pending-requests dialog), friends + friends feed, block and mute, the central `Viewer` / `can_view` filter and its test matrix. Done early because every later query depends on it |
 | 3 Threads, tags and mentions | `parent_id` replies (visibility inherited from the root), thread view, tags with chip UI, `@mentions` (parsing, `post_mentions`, autocomplete), search by keyword |
 | 4 Media | Uploads (limits from `.env`), pipeline (thumbnail, NSFW, caption, embedding), hide-sensitive, semantic search |
-| 5 Extras | Stickers, polls, emoji autocomplete, reposts, stories (with per-story visibility), discover feed, trending |
-| 6 Notifications and topbar | `notifications`, bell popup, notification settings, system notices, announcements, topbar |
+| 5 Extras | Stickers, polls, emoji autocomplete, reposts, stories (with per-story visibility), saved posts and collections, discover feed, trending |
+| 6 Notifications and topbar | `notifications` (follow requests, replies, mentions, reposts, likes, poll results, system), per-kind notification settings, bell popup, announcements, topbar |
 | 7 Chat | WebSocket, persistence, Redis fan-out, read receipts, typing (with hide-typing setting), chat media, unread badge |
-| 8 Moderation | Mod role, view-delete/restore (posts and stories), report post, AI flags on posts and the mod queue, admin panel, hard delete, audit log, bans (account and soft IP) |
-| 9 Hardening | L1/L2 caching incl. anonymous page cache, app-level rate limits, hard IP bans in nginx (generated blocklist + reload watcher), metrics, backups, load testing |
-| 10 Scale | MinIO/S3, Postgres read replicas, dedicated search/GPU nodes if needed |
-| Maybe | Transcode / compression worker, Kubernetes (see §15) |
+| 8 Moderation | Mod role, view-delete/restore (posts and stories), report post, AI flags on posts and the mod queue, admin panel, hard delete, audit log, account bans (mods and admins), soft IP bans (admins), staff search for banned accounts and deleted posts |
+| 9 Account lifecycle | Disable account, permanent deletion with grace period and purge job, data export |
+| 10 Hardening | L1/L2 caching incl. anonymous page cache, app-level rate limits, hard IP bans in nginx (generated blocklist + reload watcher), metrics, backups, load testing |
+| 11 Scale | MinIO/S3, Postgres read replicas, dedicated search/GPU nodes if needed |
+| Maybe | Transcode / compression worker, Kubernetes, everything in §16 |
 
 ---
 
@@ -891,54 +975,80 @@ Related tunables that are configuration rather than on/off flags: `OLLAMA_MODERA
 
 ### Decided
 
-Reposts, stories, anonymous browsing, follow approval, friends and the friends feed, block and mute, post reports, AI sensitivity flags, the hide-typing-indicator setting, notifications (separate from chat) and a Trending page are part of the plan (§3 to §10).
+Reposts, stories, saved posts, anonymous browsing, follow approval, friends and the friends feed, block and mute, post reports, AI sensitivity flags, the hide-typing-indicator setting, notifications (separate from chat) and a Trending page are part of the plan (§3 to §10).
 
 - **Visibility** is three levels (`public`, `friends`, `private`) per account section and per post, replacing the old public/private switch. The account setting is the ceiling and a post can only narrow it (§3.2).
 - **Replies inherit the root post's visibility** and it cannot be changed per reply (§3.2).
 - **Stories have a per-story visibility** (`public | friends | private`) like posts, capped by the account's `stories_visibility` (§3.2).
 - **Mentions** (`@username`) are a feature, with a `mention` notification and a `mention_policy` setting (§4.2, §8.2).
-- **Three kinds of bans**: account ban (view-deletes everything, reversible), soft IP ban (blocks login and registration), hard IP ban (blocks the IP from the site, enforced in nginx) (§3.7).
+- **Bans**: account bans can be issued by mods and admins, IP bans (soft and hard) only by admins and are expected to be rare (§3.7). Normal users and visitors can't find a banned account, and `/u/:username` always shows "This account has been banned". Mods and admins can search banned accounts and their deleted posts.
+- **Notifications** now include reposts, likes and poll results, and **every kind has its own on/off setting** except moderation and security messages (§8.2, §8.3).
+- **Post text** is plain text with simple inline marks (`*bold*`, `_italic_`, and similar), not Markdown (§4.2).
+- **Email** is required and must be confirmed with a long, non-expiring token before an account can do anything. Unconfirmed accounts behave like anonymous visitors (§3.8).
+- **Disable account** (hidden, reversible by logging in), **permanent deletion** (grace period, then a purge) and **data export** (§3.8).
+- **Saved posts** with private collections, and a default collection named `*` (§4.2).
 - **Hidden things are not special-cased for followers.** Followers who are not friends see only `public` content.
 - **Muted accounts' replies** stay visible in threads. Mute only affects feeds, discover, search and the story tray (§3.5).
 - **Avatar** is always visible, even when everything else is private.
 - **Turning follow approval off** asks what to do with pending requests: stay pending (default), reject all, accept all (§3.4).
 - **Limits** are global and live in `.env`: video 50 MB and 10 minutes, image 50 MB (§13.2).
 - **Heavy features** can be switched off with flags in `.env` (§13.3).
+- **Rate limits**: lenient for media, tighter for pages (§9).
 
 ### Open (the README currently assumes the default in brackets)
 
 1. **Notifications from muted accounts.** (Still created; mute only quiets feeds, discover, search and stories. If you want mute to be quiet everywhere, suppress them.)
 2. **Chat badge** counts unread conversations, not unread messages. (Conversations, capped at 99+.)
 3. **Does the reply author's own `posts_visibility` apply to their replies?** (Not inside the thread, where only the root's visibility counts. On the author's profile a reply is listed only if the viewer can see the thread and the author's `posts_visibility` also allows them.)
-4. **Who can ban?** (Admins only. Mods keep view-delete. Should mods be able to issue temporary account bans?)
-5. **Hard-ban response.** (A static 403 page, so a wrongly banned human can see what happened. The alternative is closing the connection silently with nginx `444`, better against bots.)
-6. **What a banned account's profile shows.** (A "This account is banned" notice with name, username and avatar, and no content.)
-7. **Mention defaults.** (`mention_policy` defaults to `everyone`, and at most 10 mentions count per post.)
+4. **Can mods lift a ban an admin issued?** (No. Mods can only lift bans issued by mods, and cannot ban other mods or admins.)
+5. **Can mods see a banned account's `friends` / `private` content?** (No, that stays admin-only. Mods see its public and view-deleted content.)
+6. **What does "Skip" on the welcome guide leave?** (Every section stays `private`, with a reminder banner on the profile. The alternative is to apply the Public preset.)
+7. **Unconfirmed accounts that never confirm.** (Kept forever. `UNCONFIRMED_ACCOUNT_TTL_DAYS` can delete them so they don't hold usernames.)
+8. **What permanent deletion takes with it.** (Everything the account made, including other people's replies under its posts and the DMs it sent. The alternative is to keep other people's replies under a "[deleted]" tombstone.)
+9. **Messages from a disabled account.** (They stay visible to the other person, who sees an "Unavailable user".)
+10. **The default collection `*`.** (It only holds posts saved without choosing a collection. The `/saved` page has an "All" tab that shows everything saved. Alternative: `*` always lists everything.)
+11. **Hard-ban response.** (A static 403 page, so a wrongly banned human can see what happened. The alternative is closing the connection silently with nginx `444`, better against bots.)
+12. **Mention defaults.** (`mention_policy` defaults to `everyone`, and at most 10 mentions count per post.)
 
 ### Maybe
 
 - **Transcode / compression worker**: a worker that re-encodes video and recompresses images on upload. It would also make the size limits easier to live with.
 - **Hosting**: single VPS with Docker Compose now, Kubernetes later?
+- **Everything in §16** is kept as a maybe.
 
 ---
 
-## 16. Ideas and gaps (proposals, not part of the plan yet)
+## 16. Maybes (ideas kept for later)
 
-Things I think are missing. Nothing here is decided, and none of it is reflected in the data model above.
+Kept for later. None of this is in the data model above.
 
-**Worth fixing before launch**
+**Email and accounts**
 
-- **Email.** `/password-reset` exists as a route, but nothing in the plan sends mail. It needs SMTP or a provider, email verification, and optionally notification emails. Along with it: two-factor login (TOTP) and a "your sessions" page where users can see and revoke logins.
+- **Password reset by email**, reusing the mail and token machinery from §3.8. Unlike the confirmation link, reset tokens should expire quickly.
+- **Changing your email** later, which requires confirming the new address before it replaces the old one.
+- **Notification emails** and a daily digest, **two-factor login** (TOTP), and a "your sessions" page where users can see and revoke logins.
+- **Blocking disposable-email domains** at registration.
+
+**Safety and moderation**
+
 - **Anti-bot signup.** A CAPTCHA (e.g. Cloudflare Turnstile or hCaptcha) on `/register`, and stricter limits for brand-new accounts (posting rate, links, mentions, DMs to non-friends) that relax as the account ages.
-- **Account deletion and data export.** User-initiated deletion with a grace period, then a purge of rows and media files, plus an export of the user's own data. Legally required in many regions.
-- **Terms and policies.** Terms of Service, Privacy Policy, cookie notice and a minimum-age checkbox at registration. Store `terms_version` / `terms_accepted_at` per user so a "terms updated" notice (§8.2) can require re-acceptance. A copyright takedown process.
-- **Appeals and strikes.** A form for appealing a removal or ban that creates a ticket for admins, mod notes on a user, and a strike system (warning, temporary ban, ban) built on the three ban kinds.
+- **Appeals and strikes.** A form for appealing a removal or ban that creates a ticket for admins, mod notes on a user, and a strike system (warning, temporary ban, ban) built on the ban kinds.
 - **Reports beyond posts.** Report users, stories, comments and chat messages, not only posts.
+- **Safety tools:** muted words and tags, a "restrict" option softer than block, a message-requests inbox for DMs from non-friends, author-set "sensitive / spoiler" marks in addition to the AI flag, and author-written alt text that overrides the AI description.
+
+**Legal and housekeeping**
+
+- **Terms and policies.** Terms of Service, Privacy Policy, cookie notice and a minimum-age checkbox at registration. Store `terms_version` / `terms_accepted_at` per user so a "terms updated" notice (§8.2) can require re-acceptance. A copyright takedown process.
 - **Cleanup and quotas.** A job that deletes unreferenced media files, and a per-user storage cap.
 
-**Nice to have**
+**Social features**
 
-- **Social features:** bookmarks, pinning a post on your profile, following a tag, quote reposts, post edit history, drafts and scheduled posts, a "close friends" list as a fourth visibility level for posts and stories, a verified badge, a profile banner.
-- **Safety tools:** muted words and tags, a "restrict" option softer than block, a message-requests inbox for DMs from non-friends, author-set "sensitive / spoiler" marks in addition to the AI flag, and author-written alt text that overrides the AI description.
-- **Sharing and SEO:** Open Graph / Twitter card meta so shared links to public posts and profiles preview nicely, `robots.txt`, a sitemap, `noindex` for anything that is not public, and RSS for public profiles. Anonymous browsing makes these worthwhile.
-- **Operations:** an admin dashboard with abuse and queue statistics, regularly tested backup restores, alerts (queue depth, Ollama latency, 5xx rate), partitioning for `messages` and `notifications` when they grow, UI translations (there is a `language` setting but no translation plan), and an accessibility pass (keyboard use, contrast).
+- Pinning a post on your profile, following a tag, quote reposts, post edit history, drafts and scheduled posts, a "close friends" list as a fourth visibility level for posts and stories, a verified badge, a profile banner.
+
+**Sharing and SEO**
+
+- Open Graph / Twitter card meta so shared links to public posts and profiles preview nicely, `robots.txt`, a sitemap, `noindex` for anything that is not public, and RSS for public profiles. Anonymous browsing makes these worthwhile.
+
+**Operations**
+
+- An admin dashboard with abuse and queue statistics, regularly tested backup restores, alerts (queue depth, Ollama latency, 5xx rate), partitioning for `messages` and `notifications` when they grow, UI translations (there is a `language` setting but no translation plan), and an accessibility pass (keyboard use, contrast).
