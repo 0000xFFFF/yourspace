@@ -784,14 +784,12 @@ The topbar has a bell icon that opens a popup with tabs **All | Requests | Repli
 Two layers:
 
 1. **nginx** (`limit_req`, per IP), configured in [`nginx.conf`](nginx.conf):
-   - pages: **5 r/s**, burst 20 (stricter)
-   - media/static: **100 r/s**, burst 300 (you'd have to spam very hard)
+   - pages: **5 r/s**, burst 20 (stricter) (tighter limit)
+   - media/static: **100 r/s**, burst 300 (you'd have to spam very hard) (very lenient)
    - login/register: **5 r/min**, burst 5
 2. **App-level, per user/session** (Redis counters, e.g. `governor`-style): posting, liking, following, DMs and uploads. IP limits alone punish shared networks and don't stop one logged-in account.
 
 Hard IP bans (§3.7) sit in front of both layers: nginx refuses banned addresses with a static 403 before any limiter or app work. Anonymous visitors are covered by the same per-IP limits as everyone else. Their cached responses (§6) mostly never reach the app, so the limits mainly protect uncached and logged-in traffic.
-
-> Interpretation: you wrote "tiny for media, bigger for pages". I read it as *media = very lenient limit, pages = tighter limit*. If you meant the opposite, swap the two `rate=` values.
 
 ---
 
